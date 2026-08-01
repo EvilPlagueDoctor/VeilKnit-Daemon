@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>daemon_network_sdk tutorial</title>
+<link rel="stylesheet" href="sdk.css">
+</head>
+<body>
+<div style="margin:1rem auto;max-width:1100px;padding:.8rem 1rem;border:1px solid #888;border-radius:8px"><strong>Protocol v3:</strong> app-owned DHT storage, daemon-held signing keys, app-scoped reputation, and HMAC-SHA256 authentication are documented in <code>../API_V3_NOTES.md</code>.</div>
+<header class="topbar">
+  <div class="brand">docs.rs</div>
+  <div class="crate">daemon_network_sdk 0.3.0</div>
+  <a href="index.html">API Reference</a>
+  <div class="spacer"></div>
+</header>
+<div class="layout">
+<aside class="sidebar">
+  <a href="index.html">Crate daemon_network_sdk</a>
+  <a class="active" href="tutorial.html">Getting-started tutorial</a>
+  <h3>Steps</h3>
+  <a href="#project">1. Create a project</a>
+  <a href="#dependency">2. Add the SDK</a>
+  <a href="#connect">3. Connect and authorize</a>
+  <a href="#identity">4. Share identities</a>
+  <a href="#send">5. Send a message</a>
+  <a href="#receive">6. Receive messages</a>
+  <a href="#request">7. Request and respond</a>
+  <a href="#broadcast">8. Broadcast</a>
+  <a href="#shipping">9. Ship the app</a>
+</aside>
+<main>
+  <div class="breadcrumb">daemon_network_sdk / tutorial</div>
+  <h1>Building your first Daemon Network app</h1>
+  <p class="lead">This walkthrough creates a small Rust application, performs first-run user approval, prints the local identity, sends text, and listens for messages. The app never opens a Veilid route or DHT directly.</p>
+
+  <h2 id="project">1. Create a project</h2>
+<pre><code>cargo new my_network_app
+cd my_network_app</code></pre>
+  <p>The SDK is asynchronous, so the examples use Tokio.</p>
+
+  <h2 id="dependency">2. Add the SDK</h2>
+  <p>While the SDK lives beside your project, add it by path:</p>
+<pre><code>[dependencies]
+daemon_network_sdk = { path = "../A_Daemon_Network/crates/daemon_network_sdk" }
+tokio = { version = "1", features = ["full"] }</code></pre>
+  <p>Copying only <code>lib.rs</code> is not recommended. Depending on the crate keeps its manifest, examples, future modules, and version together. If the crate is published later, the path dependency can become a normal version dependency.</p>
+
+  <h2 id="connect">3. Connect and authorize</h2>
+  <p>Replace <code>src/main.rs</code> with:</p>
+<pre><code>use daemon_network_sdk::{ClientError, NetworkApp};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let app = match NetworkApp::builder("example.my-app")
+        .display_name("My First Network App")
+        .connect()
+        .await
+    {
+        Ok(app) =&gt; app,
+        Err(ClientError::AuthorizationRequired(request)) =&gt; {
+            println!("Approve this app in the daemon:");
+            println!("  {}", request.approval_command());
+            request.wait().await?
+        }
+        Err(error) =&gt; return Err(error.into()),
+    };
+
+    println!("Connected as {}", app.local_user().identity);
+    Ok(())
+}</code></pre>
+  <p>Start and log into <code>veilid_test_node.exe</code>, then run your app:</p>
+<pre><code>cargo run</code></pre>
+  <p>On the first run the app prints a command similar to:</p>
+<pre><code>app-approve 1</code></pre>
+  <p>In the daemon console you may inspect requests first:</p>
+<pre><code>app-pending
+app-approve 1</code></pre>
+  <p>The requesting process retrieves the new credential using its private request token, stores it under <code>%LOCALAPPDATA%\DaemonNetwork\credentials</code>, and completes authentication. Later launches connect without prompting.</p>
+  <div class="note"><strong>Lost credential:</strong> if the daemon says the app is already registered but the SDK cannot find its credential, run <code>app-rotate</code> in the daemon and relaunch or use the manual credential workflow.</div>
+
+  <h2 id="identity">4. Share identities</h2>
+  <p>The local identity is available as a typed value:</p>
+<pre><code>println!("Share this identity: {}", app.local_user().identity);</code></pre>
+  <p>Parse an identity received through a room key, QR code, contact file, or another trusted channel:</p>
+<pre><code>use daemon_network_sdk::NetworkIdentity;
+
+let friend: NetworkIdentity = copied_text.parse()?;</code></pre>
+  <p>The current SDK intentionally does not expose global username search. Applications decide how invitations and contact exchange should work.</p>
+
+  <h2 id="send">5. Send a message</h2>
+<pre><code>let receipt = app.send_text(&amp;friend, "Hello from my app!").await?;
+println!("Daemon accepted message {}", receipt.message_id);</code></pre>
+  <p>The daemon attempts immediate encrypted delivery through an established handshake. If that cannot be completed, it queues the same application payload through the mailbox system. Your app does not change code for offline users.</p>
+  <p>For binary formats, serialize your own packet and use <code>send</code>:</p>
+<pre><code>let packet = serde_json::to_vec(&amp;my_packet)?;
+app.send(&amp;friend, packet).await?;</code></pre>
+
+  <h2 id="receive">6. Receive messages</h2>
+<pre><code>let mut messages = app.subscribe().await?;
+
+loop {
+    let message = messages.next().await?;
+    match message.text() {
+        Ok(text) =&gt; println!("{}: {}", message.sender.short_id(), text),
+        Err(_) =&gt; println!("{} sent {} bytes", message.sender, message.payload.len()),
+    }
+}</code></pre>
+  <p>The stream is filtered by authenticated app ID. Messages retrieved while your app was closed are queued by the daemon and replayed when the subscription reconnects, subject to daemon queue limits.</p>
+  <p>You can also request an immediate offline scan:</p>
+<pre><code>app.retrieve_mail().await?;</code></pre>
+
+  <h2 id="request">7. Request and respond</h2>
+  <p>Use a conversation ID when one message expects a reply:</p>
+<pre><code>let request = app.request(&amp;friend, b"What is your status?").await?;
+println!("Conversation: {:02x?}", request.conversation_id);</code></pre>
+  <p>On the receiving side:</p>
+<pre><code>let incoming = messages.next().await?;
+if incoming.conversation_id.is_some() {
+    app.respond(&amp;incoming, b"Online").await?;
+}</code></pre>
+  <p><code>respond</code> sends to the authenticated transport sender and preserves the incoming conversation ID.</p>
+
+  <h2 id="broadcast">8. Broadcast to a group</h2>
+<pre><code>let recipients = vec![alice, bob, carol];
+let deliveries = app.broadcast(recipients, b"Meeting starts now").await;
+
+for delivery in deliveries {
+    if let Some(error) = delivery.error {
+        eprintln!("{} failed: {}", delivery.recipient, error);
+    }
+}</code></pre>
+  <p><code>broadcast</code> is bounded to 16 simultaneous sends. For very large rooms, build a room protocol or future paged/gossip transport rather than unbounded fan-out.</p>
+
+  <h2>Custom delivery options</h2>
+<pre><code>use daemon_network_sdk::{MessageOptions, NetworkApp};
+
+let options = MessageOptions {
+    conversation_id: Some(room_id),
+    expires_at: Some(unix_expiry),
+    await_response: false,
+};
+app.send_with_options(&amp;friend, packet, options).await?;</code></pre>
+
+  <h2>Handling common errors</h2>
+  <table>
+    <tr><th>Error</th><th>Meaning</th><th>Action</th></tr>
+    <tr><td><code>DaemonEndpointNotFound</code></td><td>No endpoint discovery file and no environment override.</td><td>Start and log into the daemon. Confirm both programs run under the same Windows user.</td></tr>
+    <tr><td><code>AuthorizationRequired</code></td><td>This app has no credential yet.</td><td>Show the command and wait for approval.</td></tr>
+    <tr><td><code>CredentialNotFound</code></td><td>The daemon remembers the app but its secret is unavailable locally.</td><td>Rotate the credential in the daemon.</td></tr>
+    <tr><td><code>Protocol</code></td><td>A capability was denied or an operation failed.</td><td>Display the daemon's code and message; do not retry blindly.</td></tr>
+    <tr><td><code>SubscriptionClosed</code></td><td>The daemon stopped or restarted.</td><td>Reconnect and open a new subscription.</td></tr>
+  </table>
+
+  <h2 id="shipping">9. Build and ship without Rust installed</h2>
+<pre><code>cargo build --release</code></pre>
+  <p>Distribute <code>target\release\my_network_app.exe</code>. The destination computer does not need Rust or Cargo. It does need its own running daemon, and each app installation must be approved against that computer's daemon identity store.</p>
+  <p>Applications should not ship another user's credential file. Credentials identify a local app installation and must be created or approved locally.</p>
+
+  <h2>Useful environment overrides</h2>
+  <table>
+    <tr><th>Variable</th><th>Use</th></tr>
+    <tr><td><code>DAEMON_NETWORK_ENDPOINT</code></td><td>Explicit named-pipe or Unix-socket endpoint.</td></tr>
+    <tr><td><code>DAEMON_NETWORK_CREDENTIAL</code></td><td>Exact credential JSON file.</td></tr>
+    <tr><td><code>DAEMON_NETWORK_CREDENTIAL_DIR</code></td><td>Directory for automatic credential loading and first-run storage.</td></tr>
+  </table>
+
+  <h2>Next steps</h2>
+  <ul>
+    <li>Use Serde to define an application packet with its own protocol version.</li>
+    <li>Deduplicate application-level packet IDs when direct and mailbox paths may overlap.</li>
+    <li>Keep room membership and user-facing history in the app, not in the transport SDK.</li>
+    <li>Use <a href="index.html#advanced">the advanced client</a> only when the high-level API does not expose a required daemon feature.</li>
+  </ul>
+
+  <div class="footer">The complete examples are in <code>crates/daemon_network_sdk/examples</code>. The group chat in <code>apps/group_chat</code> is a larger working example.</div>
+</main>
+</div>
+</body>
+</html>

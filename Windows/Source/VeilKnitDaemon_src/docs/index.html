@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>daemon_network_sdk - Rust</title>
+<link rel="stylesheet" href="sdk.css">
+</head>
+<body>
+<div style="margin:1rem auto;max-width:1100px;padding:.8rem 1rem;border:1px solid #888;border-radius:8px"><strong>Protocol v3:</strong> app-owned DHT storage, daemon-held signing keys, app-scoped reputation, and HMAC-SHA256 authentication are documented in <code>../API_V3_NOTES.md</code>.</div>
+<header class="topbar">
+  <div class="brand">docs.rs</div>
+  <div class="crate">daemon_network_sdk 0.3.0</div>
+  <a href="tutorial.html">Tutorial</a>
+  <div class="spacer"></div>
+  <input id="search" aria-label="Search API" placeholder="Search API items">
+</header>
+<div class="layout">
+<aside class="sidebar">
+  <a class="active" href="index.html">Crate daemon_network_sdk</a>
+  <a href="tutorial.html">Getting-started tutorial</a>
+  <h3>Main types</h3>
+  <a href="#networkapp">NetworkApp</a>
+  <a href="#networkidentity">NetworkIdentity</a>
+  <a href="#incomingmessage">IncomingMessage</a>
+  <a href="#messagestream">MessageStream</a>
+  <a href="#authorizationrequest">AuthorizationRequest</a>
+  <h3>Supporting types</h3>
+  <a href="#messageoptions">MessageOptions</a>
+  <a href="#messagereceipt">MessageReceipt</a>
+  <a href="#mailboxstatus">MailboxStatus</a>
+  <a href="#clienterror">ClientError</a>
+  <h3>Advanced</h3>
+  <a href="#advanced">advanced module</a>
+  <a href="#capabilities">AppCapability</a>
+</aside>
+<main>
+  <div class="breadcrumb">daemon_network_sdk</div>
+  <h1>Crate <code>daemon_network_sdk</code></h1>
+  <div class="version"><span class="badge safe">Windows</span><span class="badge">Protocol 2</span>High-level SDK for the Daemon Network local application API.</div>
+  <p class="lead">Applications work with users, messages, subscriptions, and request/response conversations. The SDK hides named pipes, credential files, challenge-response proofs, session tokens, direct handshakes, and offline mailbox fallback.</p>
+
+  <div class="note"><strong>Start here:</strong> most applications need only <code>NetworkApp::connect</code>, <code>NetworkIdentity</code>, <code>NetworkApp::send</code>, and <code>NetworkApp::subscribe</code>. See the <a href="tutorial.html">complete tutorial</a>.</div>
+
+  <h2>Quick example</h2>
+<pre><code>use daemon_network_sdk::{ClientError, NetworkApp};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let app = match NetworkApp::builder("example.hello")
+        .display_name("Hello Network")
+        .connect()
+        .await
+    {
+        Ok(app) =&gt; app,
+        Err(ClientError::AuthorizationRequired(request)) =&gt; {
+            println!("Approve with: {}", request.approval_command());
+            request.wait().await?
+        }
+        Err(error) =&gt; return Err(error.into()),
+    };
+
+    println!("Connected as {}", app.local_user().identity);
+    Ok(())
+}</code></pre>
+
+  <h2>Design guarantees</h2>
+  <div class="grid">
+    <div class="card"><h3>App isolation</h3><p>The daemon authenticates each app ID and filters incoming plaintext so one app cannot read another app's messages.</p></div>
+    <div class="card"><h3>Transport independence</h3><p><code>send</code> may use an established encrypted handshake or the mailbox fallback. App code does not choose or inspect the transport.</p></div>
+    <div class="card"><h3>User approval</h3><p>Missing credentials create a pending authorization request. The local daemon user must approve it before a credential is issued.</p></div>
+    <div class="card"><h3>Opaque identities</h3><p><code>NetworkIdentity</code> carries the shareable network address without requiring applications to manipulate raw DHT APIs.</p></div>
+  </div>
+
+  <h2 id="networkapp">Struct <code>NetworkApp</code></h2>
+  <p>The main authenticated application handle. Clone it freely to share it among Tokio tasks.</p>
+
+  <section class="item" data-search="NetworkApp connect automatic credentials authorization">
+    <div class="sig"><span class="kind">async fn</span> NetworkApp::connect(app_id: impl Into&lt;String&gt;) -&gt; Result&lt;NetworkApp, ClientError&gt;</div>
+    <div class="doc">Discovers a credential and endpoint, authenticates, and reads the local user identity. On first run, returns <code>ClientError::AuthorizationRequired</code>.</div>
+  </section>
+  <section class="item" data-search="NetworkApp builder display name endpoint capability credential">
+    <div class="sig"><span class="kind">fn</span> NetworkApp::builder(app_id) -&gt; NetworkAppBuilder</div>
+    <div class="doc">Use the builder to set a friendly display name, custom non-administrative capabilities, an explicit endpoint, or a credential path.</div>
+  </section>
+  <section class="item" data-search="NetworkApp local_user identity username">
+    <div class="sig"><span class="kind">fn</span> local_user(&amp;self) -&gt; &amp;LocalUser</div>
+    <div class="doc">Returns the daemon username and this user's <code>NetworkIdentity</code>.</div>
+  </section>
+  <section class="item" data-search="NetworkApp send bytes message direct mailbox">
+    <div class="sig"><span class="kind">async fn</span> send(&amp;self, recipient: &amp;NetworkIdentity, payload: impl AsRef&lt;[u8]&gt;) -&gt; Result&lt;MessageReceipt, ClientError&gt;</div>
+    <div class="doc">Queues one application payload. The daemon first attempts live encrypted delivery and falls back to offline mailbox delivery when needed.</div>
+  </section>
+  <section class="item" data-search="NetworkApp send_text utf8">
+    <div class="sig"><span class="kind">async fn</span> send_text(&amp;self, recipient: &amp;NetworkIdentity, text: impl AsRef&lt;str&gt;) -&gt; Result&lt;MessageReceipt, ClientError&gt;</div>
+    <div class="doc">Convenience wrapper for UTF-8 text.</div>
+  </section>
+  <section class="item" data-search="NetworkApp send_with_options expiration conversation response">
+    <div class="sig"><span class="kind">async fn</span> send_with_options(&amp;self, recipient, payload, options: MessageOptions) -&gt; Result&lt;MessageReceipt, ClientError&gt;</div>
+    <div class="doc">Sets a conversation ID, expiration timestamp, or response expectation.</div>
+  </section>
+  <section class="item" data-search="NetworkApp broadcast group multiple recipients">
+    <div class="sig"><span class="kind">async fn</span> broadcast(&amp;self, recipients, payload) -&gt; Vec&lt;BroadcastDelivery&gt;</div>
+    <div class="doc">Sends the same payload to multiple identities with bounded concurrency and returns one result per recipient.</div>
+  </section>
+  <section class="item" data-search="NetworkApp request conversation response">
+    <div class="sig"><span class="kind">async fn</span> request(&amp;self, recipient, payload) -&gt; Result&lt;RequestReceipt, ClientError&gt;</div>
+    <div class="doc">Creates a random 32-byte conversation ID and marks the message as awaiting a response.</div>
+  </section>
+  <section class="item" data-search="NetworkApp respond reply incoming conversation">
+    <div class="sig"><span class="kind">async fn</span> respond(&amp;self, request: &amp;IncomingMessage, payload) -&gt; Result&lt;MessageReceipt, ClientError&gt;</div>
+    <div class="doc">Replies to the sender while preserving the request's conversation ID.</div>
+  </section>
+  <section class="item" data-search="NetworkApp subscribe messages stream offline live">
+    <div class="sig"><span class="kind">async fn</span> subscribe(&amp;self) -&gt; Result&lt;MessageStream, ClientError&gt;</div>
+    <div class="doc">Opens the app-filtered stream. It receives queued daemon inbox messages first, then live messages.</div>
+  </section>
+  <section class="item" data-search="NetworkApp retrieve mail mailbox scan">
+    <div class="sig"><span class="kind">async fn</span> retrieve_mail(&amp;self) -&gt; Result&lt;(), ClientError&gt;</div>
+    <div class="doc">Requests an immediate mailbox scan instead of waiting for periodic retrieval.</div>
+  </section>
+  <section class="item" data-search="NetworkApp mailbox_status queue custodian">
+    <div class="sig"><span class="kind">async fn</span> mailbox_status(&amp;self) -&gt; Result&lt;MailboxStatus, ClientError&gt;</div>
+    <div class="doc">Returns mailbox DHT addresses, queue counts, key epoch, and known custodian count.</div>
+  </section>
+  <section class="item" data-search="NetworkApp status network json">
+    <div class="sig"><span class="kind">async fn</span> status(&amp;self) -&gt; Result&lt;serde_json::Value, ClientError&gt;</div>
+    <div class="doc">Reads the daemon's current structured network status.</div>
+  </section>
+  <section class="item" data-search="NetworkApp events subscription network">
+    <div class="sig"><span class="kind">async fn</span> events(&amp;self) -&gt; Result&lt;NetworkEventStream, ClientError&gt;</div>
+    <div class="doc">Subscribes to structured daemon events when the app has <code>SubscribeNetworkStatus</code>.</div>
+  </section>
+
+  <h2 id="networkidentity">Struct <code>NetworkIdentity</code></h2>
+  <section class="item" data-search="NetworkIdentity parse fromstr share key">
+    <div class="sig"><span class="kind">fn</span> NetworkIdentity::parse(value) -&gt; Result&lt;NetworkIdentity, ClientError&gt;</div>
+    <div class="doc">Validates a shareable typed network identity. It also implements <code>FromStr</code>, <code>Display</code>, equality, ordering, hashing, and Serde.</div>
+  </section>
+  <section class="item" data-search="NetworkIdentity as_str short_id">
+    <div class="sig"><span class="kind">fn</span> as_str(&amp;self) -&gt; &amp;str &nbsp;&nbsp; <span class="kind">fn</span> short_id(&amp;self) -&gt; String</div>
+    <div class="doc"><code>as_str</code> is the full shareable form; <code>short_id</code> is for logs and compact interfaces only.</div>
+  </section>
+
+  <h2 id="incomingmessage">Struct <code>IncomingMessage</code></h2>
+  <table>
+    <tr><th>Field</th><th>Meaning</th></tr>
+    <tr><td><code>sender</code></td><td>Authenticated transport sender as a <code>NetworkIdentity</code>.</td></tr>
+    <tr><td><code>recipient</code></td><td>The local network identity.</td></tr>
+    <tr><td><code>message_id</code></td><td>Deduplication and diagnostics identifier.</td></tr>
+    <tr><td><code>conversation_id</code></td><td>Optional 32-byte request/response correlation ID.</td></tr>
+    <tr><td><code>payload</code></td><td>Application bytes. Call <code>text()</code> for UTF-8.</td></tr>
+    <tr><td><code>posted_at</code> / <code>expires_at</code></td><td>Unix timestamps supplied by the transport.</td></tr>
+  </table>
+
+  <h2 id="messagestream">Struct <code>MessageStream</code></h2>
+  <section class="item" data-search="MessageStream next receive">
+    <div class="sig"><span class="kind">async fn</span> next(&amp;mut self) -&gt; Result&lt;IncomingMessage, ClientError&gt;</div>
+    <div class="doc">Waits for the next message. A closed local IPC subscription returns <code>SubscriptionClosed</code>.</div>
+  </section>
+
+  <h2 id="authorizationrequest">Struct <code>AuthorizationRequest</code></h2>
+  <p>Returned inside <code>ClientError::AuthorizationRequired</code> when no credential exists.</p>
+  <section class="item" data-search="AuthorizationRequest approval_command request_id">
+    <div class="sig"><span class="kind">fn</span> approval_command(&amp;self) -&gt; String</div>
+    <div class="doc">Returns the exact console command, such as <code>app-approve 3</code>.</div>
+  </section>
+  <section class="item" data-search="AuthorizationRequest wait timeout credentials">
+    <div class="sig"><span class="kind">async fn</span> wait(self) -&gt; Result&lt;NetworkApp, ClientError&gt;</div>
+    <div class="doc">Polls the daemon until approved, rejected, expired, or timed out. On approval the SDK saves the credential and completes authentication.</div>
+  </section>
+
+  <h2 id="messageoptions">Struct <code>MessageOptions</code></h2>
+  <table><tr><th>Field</th><th>Default</th><th>Use</th></tr>
+    <tr><td><code>conversation_id</code></td><td><code>None</code></td><td>Correlate requests, responses, rooms, or application sessions.</td></tr>
+    <tr><td><code>expires_at</code></td><td>Daemon default</td><td>Unix timestamp after which mailbox delivery should stop.</td></tr>
+    <tr><td><code>await_response</code></td><td><code>false</code></td><td>Ask the mailbox layer to track a response.</td></tr>
+  </table>
+
+  <h2 id="messagereceipt">Structs <code>MessageReceipt</code>, <code>RequestReceipt</code>, and <code>BroadcastDelivery</code></h2>
+  <p>Receipts mean the daemon accepted work; they do not prove the remote application displayed or acknowledged the payload.</p>
+
+  <h2 id="mailboxstatus">Struct <code>MailboxStatus</code></h2>
+  <p>Contains <code>mailbox_dht</code>, <code>mail_send_dht</code>, <code>mail_response_dht</code>, <code>receive_key_epoch</code>, pending page sets, outgoing count, awaiting-response count, and known custodian count.</p>
+
+  <h2 id="clienterror">Enum <code>ClientError</code></h2>
+  <table><tr><th>Variant</th><th>Typical response</th></tr>
+    <tr><td><code>AuthorizationRequired</code></td><td>Show the approval command and call <code>request.wait()</code>.</td></tr>
+    <tr><td><code>CredentialNotFound</code></td><td>The app is registered but its secret file is missing. Rotate it with <code>app-rotate</code>.</td></tr>
+    <tr><td><code>DaemonEndpointNotFound</code></td><td>Start and log into the daemon, or set <code>DAEMON_NETWORK_ENDPOINT</code>.</td></tr>
+    <tr><td><code>Protocol</code></td><td>The daemon rejected an operation or capability.</td></tr>
+    <tr><td><code>SubscriptionClosed</code></td><td>Reconnect after the daemon restarts.</td></tr>
+  </table>
+
+  <h2 id="capabilities">Enum <code>AppCapability</code></h2>
+  <p>The default high-level connection requests messaging, receiving, public-profile reads, and network status. Administrative capabilities are never granted through first-run app authorization.</p>
+
+  <h2 id="advanced">Module <code>advanced</code></h2>
+  <p>Re-exports <code>NetworkApiClient</code>, <code>CredentialFile</code>, raw message subscriptions, and session structures. Use it only when a daemon protocol operation has not yet been wrapped by <code>NetworkApp</code>.</p>
+  <div class="warning"><strong>Current scope:</strong> a global username search or peer-directory API is not exposed yet. Applications exchange <code>NetworkIdentity</code> values explicitly, such as through room keys, QR codes, contacts, or invitation messages.</div>
+
+  <div class="footer">Generated companion documentation for daemon_network_sdk 0.3.0. Open <code>tutorial.html</code> for a complete project walkthrough.</div>
+</main>
+</div>
+<script src="sdk.js"></script>
+</body>
+</html>
