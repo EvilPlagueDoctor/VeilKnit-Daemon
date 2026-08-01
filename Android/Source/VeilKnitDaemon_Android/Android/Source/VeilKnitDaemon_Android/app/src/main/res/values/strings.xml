@@ -1,6 +1,0 @@
-<resources>
-    <string name="app_name">VeilKnit Daemon</string>
-    <string name="instance_name">Single node</string>
-    <string name="notification_channel_name">VeilKnit daemon</string>
-    <string name="notification_channel_description">Keeps the VeilKnit peer-to-peer node running</string>
-</resources>
