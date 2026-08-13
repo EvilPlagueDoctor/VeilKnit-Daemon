@@ -1,0 +1,36 @@
+# Rust
+**/target/
+# Android/Gradle
+**/.gradle/
+**/build/
+**/local.properties
+**/.cxx/
+# Visual Studio / MSVC
+**/.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+*.pdb
+*.ilk
+*.ipch
+*.tlog
+# Linux/CMake output
+**/dist/
+**/out/
+CMakeFiles/
+CMakeCache.txt
+# Runtime secrets and user data
+**/app_credentials/
+**/credential*.json
+**/rooms-v1.json
+**/users/
+*.log
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Kotlin compiler caches
+**/.kotlin/
