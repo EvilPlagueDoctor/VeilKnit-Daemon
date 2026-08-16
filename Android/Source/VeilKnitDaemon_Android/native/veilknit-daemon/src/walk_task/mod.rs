@@ -1547,7 +1547,11 @@ impl RecordTableWriter {
                                 }
                             }
                         }
-                        if let Err(error) = publisher.publish(entries).await {
+                        let outcome = publisher.publish(entries).await;
+                        crate::net_health::record_result(
+                            outcome.as_ref().err().map(|error| error.to_string()).as_deref(),
+                        );
+                        if let Err(error) = outcome {
                             crate::teprintln!("[walk] paged record-table publication failed: {error}");
                         }
                     }

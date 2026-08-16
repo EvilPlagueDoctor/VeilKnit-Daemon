@@ -76,6 +76,12 @@ use crate::{
 
 pub const LOCAL_API_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_API_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// Ceiling on publishing this app's root record to the directory.
+///
+/// Generous, because a healthy publish on a slow mobile link can take a while, but finite so
+/// that an offline node produces an error the caller can show instead of a hung binder call.
+const APP_ROOT_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const MAX_API_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_APPLICATION_MESSAGES: usize = 16_384;
 const MAX_PENDING_APPLICATION_MESSAGES_PER_APP: usize = 4_096;
@@ -3212,10 +3218,28 @@ async fn process_request(
                 .parse::<RecordKey>()
                 .map_err(|error| ("invalid_record_key", format!("{error:?}")))?;
             let app_id = canonical_application_id(&session.app_id().to_string());
-            let update = manager
-                .set_own_app_root(&app_id, root_dht)
-                .await
-                .map_err(|error| ("app_directory_error", error))?;
+            // Bounded on purpose. This publishes to the app directory DHT, and on a node
+            // that has gone offline the call otherwise never returns - the client is a
+            // blocking binder transaction, so an unbounded await here parks the calling
+            // app's thread indefinitely with no way to recover but a restart.
+            let update = match tokio::time::timeout(
+                APP_ROOT_PUBLISH_TIMEOUT,
+                manager.set_own_app_root(&app_id, root_dht),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|error| ("app_directory_error", error))?,
+                Err(_) => {
+                    crate::net_health::record_result(Some("TryAgain: offline, try again later"));
+                    return Err((
+                        "app_directory_timeout",
+                        format!(
+                            "publishing the app root did not complete within {} seconds; the node may be offline",
+                            APP_ROOT_PUBLISH_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+            };
             Ok(ProcessResult::Response(ApiResult::AppRootRegistered {
                 app_id: update.app_id,
                 root_dht: update.root_dht.expect("set app root always returns a root").to_string(),

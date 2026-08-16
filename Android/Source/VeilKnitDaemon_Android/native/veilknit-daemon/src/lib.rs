@@ -17,6 +17,7 @@ mod blob_store;
 mod stream_transport;
 mod dht_module;
 mod handshake;
+mod net_health;
 mod network_supervisor;
 mod node;
 mod node_list;
