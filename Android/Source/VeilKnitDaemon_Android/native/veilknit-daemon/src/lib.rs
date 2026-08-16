@@ -1905,7 +1905,7 @@ pub async fn run_daemon(
                 if apps.is_empty() {
                     crate::tprintln!("No applications are registered.");
                 } else {
-                    for app in apps {
+                    for app in &apps {
                         crate::tprintln!(
                             "{} | {} | enabled={} | generation={} | capabilities={:?}",
                             app.app_id,
@@ -1916,6 +1916,22 @@ pub async fn run_daemon(
                         );
                     }
                 }
+
+                // Machine-readable copy for the GUI. The human-readable block above is kept
+                // for console users; this exists so the Applications tab can offer a list to
+                // pick from instead of asking someone to type an app id by hand.
+                crate::tprintln!("[gui] GUI_LOCAL_APPS_BEGIN");
+                for app in &apps {
+                    crate::tprintln!(
+                        "[gui] GUI_LOCAL_APP=app_hex={};name_hex={};enabled={};generation={};capabilities={}",
+                        hex::encode(app.app_id.to_string().as_bytes()),
+                        hex::encode(app.display_name.as_bytes()),
+                        if app.enabled { 1 } else { 0 },
+                        app.credential_generation,
+                        app.granted_capabilities.iter().count(),
+                    );
+                }
+                crate::tprintln!("[gui] GUI_LOCAL_APPS_END");
             }
 
             "app-rotate" | "APP-ROTATE" => {

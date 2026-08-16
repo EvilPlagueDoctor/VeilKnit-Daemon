@@ -61,6 +61,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.foundation.clickable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -1193,7 +1194,69 @@ private fun ApplicationsPage(state: DaemonUiState, snackbarHostState: SnackbarHo
         }
 
         if (advanced) {
+            // Refresh the registered list whenever the panel is opened, so the rows reflect
+            // what the daemon currently holds rather than whatever was last typed.
+            LaunchedEffect(advanced, state.ready) {
+                if (state.ready) send(context, "app-list")
+            }
+
             Spacer(Modifier.height(10.dp))
+            SectionTitle("Registered applications")
+            if (state.localApps.isEmpty()) {
+                Text(
+                    tr("No applications are registered on this daemon yet."),
+                    color = VeilMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                state.localApps.forEach { app ->
+                    val selected = appId.trim() == app.appId
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .clickable {
+                                // Selecting fills the fields below, so rotating or renaming
+                                // never requires retyping an app id by hand.
+                                appId = app.appId
+                                displayName = app.displayName
+                            },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (selected) VeilEdit else VeilPanel,
+                        ),
+                    ) {
+                        Column(Modifier.padding(10.dp)) {
+                            Text(
+                                app.displayName.ifBlank { app.appId },
+                                color = VeilText,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(app.appId, color = VeilMuted, style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                tr("Key generation") + ": ${app.credentialGeneration}   |   " +
+                                    tr("Capabilities") + ": ${app.capabilityCount}" +
+                                    if (app.enabled) "" else "   |   " + tr("disabled"),
+                                color = VeilMuted,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            if (selected) {
+                                Spacer(Modifier.height(8.dp))
+                                ActionButton(
+                                    tr("Rotate this app's key"),
+                                    state.ready,
+                                ) { send(context, "app-rotate", app.appId) }
+                                Text(
+                                    tr("Use this after reinstalling an app. It clears the old credential so the app can register again."),
+                                    color = VeilMuted,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
             SectionTitle("Local applications")
             SingleLineField(appId, { appId = it }, "Application id")
             Spacer(Modifier.height(8.dp))

@@ -30,6 +30,18 @@ data class PendingAppRequestUi(
     val expiresAt: Long = 0,
 )
 
+/**
+ * An application registered on this daemon, as opposed to [FoundAppUi], which is an
+ * application observed advertising itself on the network. Only the former can be rotated.
+ */
+data class LocalAppUi(
+    val appId: String,
+    val displayName: String,
+    val enabled: Boolean = true,
+    val credentialGeneration: Long = 0,
+    val capabilityCount: Int = 0,
+)
+
 data class FoundAppUi(
     val appId: String,
     val observedHeaders: Int = 0,
@@ -78,6 +90,7 @@ data class DaemonUiState(
     val networkSummary: NetworkSummaryUi = NetworkSummaryUi(),
     val pendingAppRequests: List<PendingAppRequestUi> = emptyList(),
     val foundApps: List<FoundAppUi> = emptyList(),
+    val localApps: List<LocalAppUi> = emptyList(),
     val logs: List<String> = emptyList(),
     val lastError: String? = null,
 )
@@ -101,6 +114,7 @@ object DaemonStateStore {
                 networkSummary = NetworkSummaryUi(),
                 pendingAppRequests = emptyList(),
                 foundApps = emptyList(),
+                localApps = emptyList(),
                 logs = emptyList(),
                 lastError = null,
             )
@@ -160,6 +174,22 @@ object DaemonStateStore {
                         }
                     }
                     "gui_app_requests_end" in lower -> Unit
+                    "gui_local_apps_begin" in lower -> {
+                        next = next.copy(localApps = emptyList())
+                    }
+                    "gui_local_app=" in lower -> {
+                        val marker = "GUI_LOCAL_APP="
+                        val markerIndex = line.indexOf(marker, ignoreCase = true)
+                        if (markerIndex >= 0) {
+                            parseLocalApp(line.substring(markerIndex + marker.length))?.let { app ->
+                                next = next.copy(
+                                    localApps = (next.localApps.filterNot { it.appId == app.appId } + app)
+                                        .sortedBy { it.appId },
+                                )
+                            }
+                        }
+                    }
+                    "gui_local_apps_end" in lower -> Unit
                     "gui_apps_begin" in lower -> {
                         next = next.copy(foundApps = emptyList())
                     }
@@ -327,6 +357,18 @@ private fun parsePendingAppRequest(value: String): PendingAppRequestUi? {
         displayName = displayName,
         requestedAt = fields["requested_at"]?.toLongOrNull() ?: 0L,
         expiresAt = fields["expires_at"]?.toLongOrNull() ?: 0L,
+    )
+}
+
+private fun parseLocalApp(value: String): LocalAppUi? {
+    val fields = guiFields(value)
+    val appId = fields["app_hex"]?.let(::decodeHexUtf8)?.takeIf { it.isNotBlank() } ?: return null
+    return LocalAppUi(
+        appId = appId,
+        displayName = fields["name_hex"]?.let(::decodeHexUtf8).orEmpty(),
+        enabled = fields["enabled"] != "0",
+        credentialGeneration = fields["generation"]?.toLongOrNull() ?: 0L,
+        capabilityCount = fields["capabilities"]?.toIntOrNull() ?: 0,
     )
 }
 
