@@ -1,0 +1,22 @@
+{
+  "name": "shutdown-blocking-hook",
+  "description": "A hook occupies a worker thread. Proves the watchdog is not starvable, which a timer task would be.",
+  "budget_scale": 0.02,
+  "hooks": [
+    {
+      "module": "wedged",
+      "need": "storage",
+      "behaviour": "block_thread",
+      "ms": 60000
+    },
+    {
+      "module": "normal",
+      "need": "storage",
+      "behaviour": "ok",
+      "ms": 10
+    }
+  ],
+  "expect": {
+    "watchdog_fired": true
+  }
+}
