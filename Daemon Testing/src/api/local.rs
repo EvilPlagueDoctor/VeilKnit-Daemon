@@ -3230,6 +3230,7 @@ async fn process_request(
             {
                 Ok(result) => result.map_err(|error| ("app_directory_error", error))?,
                 Err(_) => {
+                    crate::net_health::record_result(Some("TryAgain: offline, try again later"));
                     return Err((
                         "app_directory_timeout",
                         format!(
