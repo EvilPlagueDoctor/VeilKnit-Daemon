@@ -47,7 +47,7 @@ use crate::events::network_events::StartupStage;
 
 mod gate;
 
-pub use gate::{StageGate, StageGates};
+pub use gate::{StageGate, StageGates, StageOutcome};
 
 // ---------------------------------------------------------------------------
 // Budgets

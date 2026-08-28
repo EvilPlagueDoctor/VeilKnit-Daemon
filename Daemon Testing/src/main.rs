@@ -42,7 +42,6 @@ use std::{
 };
 
 mod mailbox;
-#[cfg(target_os = "android")]
 // Desktop stand-in for the JNI bridge. Same function names, so `node` and `user_dht` are
 // copied from the Android tree unmodified.
 #[path = "desktop_bridge.rs"]
