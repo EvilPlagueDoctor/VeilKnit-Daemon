@@ -76,8 +76,8 @@ impl StageGate {
             Ok(outcome) => outcome,
             Err(_) => {
                 crate::teprintln!(
-                    "[lifecycle] waited {}s for {:?} without it becoming ready",
-                    limit.as_secs(),
+                    "[lifecycle] waited {}ms for {:?} without it becoming ready",
+                    limit.as_millis(),
                     self.stage
                 );
                 StageOutcome::Pending

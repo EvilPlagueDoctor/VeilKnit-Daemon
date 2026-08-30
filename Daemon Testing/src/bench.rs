@@ -54,6 +54,13 @@ struct Scenario {
     /// Modules that wait on a stage before the stop begins.
     #[serde(default)]
     waiters: Vec<WaiterDef>,
+    /// Starts a task that ticks on a fixed interval for the duration of the stop.
+    ///
+    /// The only direct evidence of runtime starvation. A `tokio::time::sleep` that does not
+    /// fire proves the time driver was never polled, which cannot be inferred from hook
+    /// timings alone.
+    #[serde(default)]
+    canary: bool,
     #[serde(default)]
     expect: Expectations,
 }
@@ -89,9 +96,16 @@ enum Behaviour {
     Ok,
     /// Returns an error rather than hanging.
     Error,
-    /// Occupies a runtime worker with a synchronous sleep. This is the shape a timeout
-    /// expressed as a task cannot interrupt, and the reason the watchdog is a thread.
+    /// Occupies a blocking-pool thread with a synchronous sleep. Cannot be cancelled, so it
+    /// proves overrun is judged on measured time rather than on the timeout firing - but it
+    /// starves nothing, because the blocking pool is separate from the workers.
     BlockThread,
+    /// Occupies a runtime WORKER thread, not the blocking pool.
+    ///
+    /// The only behaviour that can still starve the runtime now hooks run via spawn_blocking,
+    /// and therefore the only way to reach the watchdog at all. Without this the watchdog is
+    /// untestable and we would be trusting code no scenario exercises.
+    StarveWorker,
     /// Panics inside the hook, to prove one bad module does not take the tier down.
     Panic,
 }
@@ -134,6 +148,17 @@ struct Expectations {
     /// Modules that must not have run at all.
     #[serde(default)]
     never_ran: Vec<String>,
+    /// module -> substring its recorded detail must contain. Checks the abandoned hook's last
+    /// reported step survived, which is the whole reason Progress exists.
+    #[serde(default)]
+    details: BTreeMap<String, String>,
+    /// Modules that must have flagged themselves as needing verification.
+    #[serde(default)]
+    needs_verification: Vec<String>,
+    /// Longest gap the canary is allowed between ticks. A gap far larger than the interval
+    /// means the runtime was starved.
+    #[serde(default)]
+    canary_max_gap_ms: Option<u128>,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +203,56 @@ impl EventLog {
 // ---------------------------------------------------------------------------
 // Running one scenario
 // ---------------------------------------------------------------------------
+
+/// How often the canary ticks while a stop is in progress.
+const CANARY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Evidence collected by the canary task.
+#[derive(Default)]
+struct CanaryReport {
+    ticks: u64,
+    longest_gap: Duration,
+}
+
+/// Ticks on a timer for the duration of the stop and records the longest gap between ticks.
+///
+/// This is the measurement that separates "the timeout did not fire" from "nothing could
+/// run". If the gap stays near [`CANARY_INTERVAL`] the runtime kept working and a missed
+/// timeout has some other cause; if it balloons to the length of a blocking hook, the time
+/// driver was never polled and every timeout in flight was helpless by construction.
+fn spawn_canary(log: EventLog) -> (tokio::task::JoinHandle<()>, Arc<Mutex<CanaryReport>>) {
+    let report = Arc::new(Mutex::new(CanaryReport::default()));
+    let collected = report.clone();
+
+    let handle = tokio::spawn(async move {
+        let mut last = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(CANARY_INTERVAL).await;
+            let now = std::time::Instant::now();
+            let gap = now.duration_since(last);
+            last = now;
+
+            let mut guard = collected.lock().unwrap();
+            guard.ticks += 1;
+            if gap > guard.longest_gap {
+                guard.longest_gap = gap;
+            }
+            let ticks = guard.ticks;
+            drop(guard);
+
+            // Only the surprising ticks are logged. A tick every 50ms for a minute would bury
+            // everything else; a tick that arrived a minute late is the whole point.
+            if gap > CANARY_INTERVAL * 4 {
+                log.record(
+                    "canary",
+                    format!("tick {ticks} arrived {}ms after the previous one", gap.as_millis()),
+                );
+            }
+        }
+    });
+
+    (handle, report)
+}
 
 struct Verdict {
     name: String,
@@ -224,7 +299,7 @@ async fn run_scenario(scenario: Scenario) -> Verdict {
         }
 
         lifecycle
-            .register(spec, move || {
+            .register(spec, move |progress| {
                 let def = def.clone();
                 let log = log.clone();
                 let invocations = invocations.clone();
@@ -235,10 +310,17 @@ async fn run_scenario(scenario: Scenario) -> Verdict {
                         .entry(def.module.clone())
                         .or_insert(0) += 1;
                     log.record(&def.module, format!("hook entered ({:?})", def.behaviour));
+                    progress.step(format!("{:?} for {}ms", def.behaviour, def.ms));
 
                     match def.behaviour {
                         Behaviour::Ok => {
-                            tokio::time::sleep(Duration::from_millis(def.ms)).await;
+                            // Split into halves so an abandoned hook's recorded step is a
+                            // phase rather than the whole hook - the point of the mechanism.
+                            progress.step("first half");
+                            tokio::time::sleep(Duration::from_millis(def.ms / 2)).await;
+                            progress.fragile("second half, mid-write");
+                            tokio::time::sleep(Duration::from_millis(def.ms - def.ms / 2)).await;
+                            progress.settled("finished cleanly");
                             log.record(&def.module, "work complete");
                             Ok(())
                         }
@@ -248,9 +330,25 @@ async fn run_scenario(scenario: Scenario) -> Verdict {
                             Err("mock failure".to_string())
                         }
                         Behaviour::BlockThread => {
+                            progress.fragile("blocking, cannot be interrupted");
                             log.record(&def.module, "occupying a worker thread");
                             std::thread::sleep(Duration::from_millis(def.ms));
                             log.record(&def.module, "released the worker thread");
+                            Ok(())
+                        }
+                        Behaviour::StarveWorker => {
+                            // Spawned onto the runtime rather than run here: this hook is
+                            // itself on a blocking thread, so blocking again would starve
+                            // nothing. The spawned task is what occupies a worker.
+                            progress.fragile("starving a runtime worker");
+                            log.record(&def.module, "starving a runtime worker");
+                            let handle = tokio::runtime::Handle::current();
+                            let ms = def.ms;
+                            let occupied = handle.spawn(async move {
+                                std::thread::sleep(Duration::from_millis(ms));
+                            });
+                            let _ = occupied.await;
+                            log.record(&def.module, "released the runtime worker");
                             Ok(())
                         }
                         Behaviour::Panic => {
@@ -313,6 +411,16 @@ async fn run_scenario(scenario: Scenario) -> Verdict {
         let _ = task.await;
     }
 
+    let canary = if scenario.canary {
+        log.record(
+            "canary",
+            format!("ticking every {}ms for the duration of the stop", CANARY_INTERVAL.as_millis()),
+        );
+        Some(spawn_canary(log.clone()))
+    } else {
+        None
+    };
+
     let refreshes = Arc::new(AtomicU64::new(0));
     let refresh_counter = refreshes.clone();
     let refresh_log = log.clone();
@@ -335,6 +443,12 @@ async fn run_scenario(scenario: Scenario) -> Verdict {
         driver.abort();
     }
 
+    let canary_report = canary.map(|(handle, report)| {
+        handle.abort();
+        let guard = report.lock().unwrap();
+        CanaryReport { ticks: guard.ticks, longest_gap: guard.longest_gap }
+    });
+
     // --- summary table. This is the part worth diffing between runs; the event stream above
     // interleaves differently every time because tiers run concurrently.
     println!("{}", "-".repeat(78));
@@ -351,8 +465,30 @@ async fn run_scenario(scenario: Scenario) -> Verdict {
     if refreshes.load(Ordering::Relaxed) > 0 {
         println!("  reachability resolved by cheap read");
     }
+    if let Some(report) = &canary_report {
+        let expected = elapsed.as_millis() / CANARY_INTERVAL.as_millis().max(1);
+        println!(
+            "  canary    {} tick(s), expected about {expected}, longest gap {}ms",
+            report.ticks,
+            report.longest_gap.as_millis()
+        );
+        if report.longest_gap > CANARY_INTERVAL * 4 {
+            println!(
+                "  RUNTIME STARVED: nothing could be polled for {}ms, so no timeout in flight could fire",
+                report.longest_gap.as_millis()
+            );
+        }
+    }
 
-    let failures = check(&scenario, &outcomes, elapsed, &lifecycle, &waiter_results, &invocations);
+    let failures = check(
+        &scenario,
+        &outcomes,
+        elapsed,
+        &lifecycle,
+        &waiter_results,
+        &invocations,
+        canary_report.as_ref(),
+    );
     println!("{}", "-".repeat(78));
     if failures.is_empty() {
         println!("VERDICT    pass");
@@ -376,6 +512,7 @@ fn check(
     lifecycle: &Lifecycle,
     waiters: &Arc<Mutex<BTreeMap<String, StageOutcome>>>,
     invocations: &Arc<Mutex<BTreeMap<String, u64>>>,
+    canary: Option<&CanaryReport>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
 
@@ -438,6 +575,40 @@ fn check(
         }
     }
 
+    for (module, fragment) in &scenario.expect.details {
+        match outcomes.iter().find(|o| &o.module == module) {
+            None => failures.push(format!("{module} produced no outcome to check detail on")),
+            Some(outcome) if !outcome.detail.contains(fragment.as_str()) => failures.push(
+                format!("{module} detail was \"{}\", expected it to contain \"{fragment}\"", outcome.detail),
+            ),
+            Some(_) => {}
+        }
+    }
+
+    for module in &scenario.expect.needs_verification {
+        match outcomes.iter().find(|o| &o.module == module) {
+            None => failures.push(format!("{module} produced no outcome to check verification on")),
+            Some(outcome) if !outcome.needs_verification => {
+                failures.push(format!("{module} did not flag itself as needing verification"))
+            }
+            Some(_) => {}
+        }
+    }
+
+    if let Some(limit) = scenario.expect.canary_max_gap_ms {
+        match canary {
+            None => failures.push(
+                "canary_max_gap_ms was declared but the scenario did not enable the canary".into(),
+            ),
+            Some(report) if report.longest_gap.as_millis() > limit => failures.push(format!(
+                "runtime was starved for {}ms, expected no gap over {}ms",
+                report.longest_gap.as_millis(),
+                limit
+            )),
+            Some(_) => {}
+        }
+    }
+
     failures
 }
 
@@ -457,6 +628,15 @@ fn describe_expectations(expect: &Expectations) -> String {
     }
     for module in &expect.never_ran {
         parts.push(format!("{module}=never_ran"));
+    }
+    if let Some(value) = expect.canary_max_gap_ms {
+        parts.push(format!("canary_gap<{value}ms"));
+    }
+    for (module, fragment) in &expect.details {
+        parts.push(format!("{module}~\"{fragment}\""));
+    }
+    for module in &expect.needs_verification {
+        parts.push(format!("{module}=needs_verification"));
     }
     if parts.is_empty() {
         "(none declared)".into()
@@ -567,7 +747,59 @@ fn load(path: &Path) -> Result<Scenario, String> {
 /// modules. That is deliberate for now - it proves the coordinator sequences correctly. Real
 /// module behaviour needs live mode and a second node reading records back, because a module
 /// reporting "written" and a module that actually wrote look identical from in here.
-pub async fn run_scenarios(target: &Path) -> i32 {
+/// Worker threads for scenario mode.
+///
+/// Fixed rather than inherited from the host. `#[tokio::main]` gives one worker per core, so
+/// how many blocking hooks it takes to starve the runtime would vary by machine, and
+/// shutdown-blocking-hook would mean something different on every box. Two is enough to show
+/// concurrency within a tier and small enough that three blocking hooks can starve it.
+const SCENARIO_WORKER_THREADS: usize = 2;
+
+/// How long to wait for abandoned blocking work before dropping the runtime anyway.
+///
+/// Short on purpose. Anything still running here has already been recorded as having overrun,
+/// so waiting on it changes no result - it only delays the exit.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
+/// Runs the scenarios on a dedicated runtime and returns the number that failed.
+///
+/// Built on its own thread because `main` is already inside a runtime and tokio refuses to
+/// build one from within another.
+pub fn run_scenarios(target: &Path) -> i32 {
+    let target = target.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("scenario-runtime".into())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(SCENARIO_WORKER_THREADS)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => {
+                    let failed = runtime.block_on(run_all(&target));
+                    // Dropping a runtime waits for its blocking tasks, so a hook the
+                    // coordinator correctly abandoned would still hold the process open until
+                    // it finished on its own. Abandoning means abandoning.
+                    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+                    failed
+                }
+                Err(error) => {
+                    eprintln!("could not build the scenario runtime: {error}");
+                    1
+                }
+            }
+        });
+
+    match spawned {
+        Ok(handle) => handle.join().unwrap_or(1),
+        Err(error) => {
+            eprintln!("could not start the scenario thread: {error}");
+            1
+        }
+    }
+}
+
+async fn run_all(target: &Path) -> i32 {
     let paths = collect_scenarios(target);
     if paths.is_empty() {
         eprintln!("No scenarios found at {}", target.display());

@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
     if let Some(path) = flag_value(&arguments, "--scenario") {
-        let failed = bench::run_scenarios(std::path::Path::new(&path)).await;
+        let failed = bench::run_scenarios(std::path::Path::new(&path));
         std::process::exit(failed);
     }
 

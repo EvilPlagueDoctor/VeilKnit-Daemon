@@ -46,8 +46,10 @@ use tokio::{sync::Mutex, task::JoinSet, time::timeout};
 use crate::events::network_events::StartupStage;
 
 mod gate;
+mod record;
 
 pub use gate::{StageGate, StageGates, StageOutcome};
+pub use record::{RawRecord, RecordedHook, ShutdownRecord};
 
 // ---------------------------------------------------------------------------
 // Budgets
@@ -158,7 +160,65 @@ pub enum Reachability {
 // ---------------------------------------------------------------------------
 
 type HookFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
-type HookAction = Box<dyn Fn() -> HookFuture + Send + Sync>;
+type HookAction = Box<dyn Fn(Progress) -> HookFuture + Send + Sync>;
+
+/// A hook's running commentary on what it is doing.
+///
+/// The single highest-value thing a shutdown log can carry. "mailbox overran" names a module
+/// with six thousand lines in it; "mailbox overran while writing pages 3/7" names the line.
+/// Because it is read after the hook has been abandoned, it has to live outside the hook's
+/// future - a cancelled future takes its locals with it.
+#[derive(Clone)]
+pub struct Progress {
+    step: Arc<std::sync::Mutex<String>>,
+    /// Set by a hook that knows being interrupted here leaves state needing a check on the
+    /// next start. The coordinator never infers this: only the module knows whether its own
+    /// half-finished write is survivable.
+    needs_verification: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Progress {
+    fn new(initial: &str) -> Self {
+        Self {
+            step: Arc::new(std::sync::Mutex::new(initial.to_string())),
+            needs_verification: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Records what the hook is doing now. Call it before each phase, not after.
+    pub fn step(&self, description: impl Into<String>) {
+        if let Ok(mut guard) = self.step.lock() {
+            *guard = description.into();
+        }
+    }
+
+    /// Marks the current step as one that leaves state needing verification if interrupted.
+    /// Pair with [`Progress::step`] around anything that rewrites a file in place.
+    pub fn fragile(&self, description: impl Into<String>) {
+        self.needs_verification
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.step(description);
+    }
+
+    /// Clears the fragile flag once the risky part is safely behind us.
+    pub fn settled(&self, description: impl Into<String>) {
+        self.needs_verification
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.step(description);
+    }
+
+    fn read(&self) -> String {
+        self.step
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    fn verification_needed(&self) -> bool {
+        self.needs_verification
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 struct Hook {
     module: String,
@@ -189,11 +249,14 @@ impl Hook {
 #[derive(Debug, Clone)]
 pub struct HookOutcome {
     pub module: String,
+    /// What the hook was doing when it finished or was abandoned.
     pub detail: String,
     pub tier: Tier,
     pub elapsed: Duration,
     pub budget: Duration,
     pub result: HookResult,
+    /// The hook was interrupted somewhere it considers unsafe, and said so itself.
+    pub needs_verification: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,14 +277,26 @@ impl fmt::Display for HookOutcome {
             HookResult::Overran => "OVERRAN".to_string(),
             HookResult::Skipped(reason) => format!("skipped ({reason})"),
         };
+        let detail = if self.detail.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", self.detail)
+        };
+        let flag = if self.needs_verification {
+            "  NEEDS VERIFICATION"
+        } else {
+            ""
+        };
         write!(
             f,
-            "{:<10} {:<26} {:>6}ms / {:>5}ms  {}",
+            "{:<10} {:<26} {:>6}ms / {:>5}ms  {}{}{}",
             self.tier.label(),
             self.module,
             self.elapsed.as_millis(),
             self.budget.as_millis(),
-            status
+            status,
+            detail,
+            flag
         )
     }
 }
@@ -243,6 +318,10 @@ pub struct Lifecycle {
     budgets: Budgets,
     watchdog_action: WatchdogAction,
     watchdog_fired: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the shutdown record is written. None disables it, which is what the bench wants.
+    data_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// Shared with the watchdog thread so a forced exit can still write what it knew.
+    progress_so_far: Arc<std::sync::Mutex<Vec<HookOutcome>>>,
 }
 
 impl Default for Lifecycle {
@@ -265,7 +344,26 @@ impl Lifecycle {
             budgets,
             watchdog_action,
             watchdog_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            data_dir: Arc::new(std::sync::Mutex::new(None)),
+            progress_so_far: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Enables the shutdown record and says where to keep it.
+    pub fn set_data_dir(&self, path: impl Into<std::path::PathBuf>) {
+        if let Ok(mut guard) = self.data_dir.lock() {
+            *guard = Some(path.into());
+        }
+    }
+
+    /// Reads and clears any record the previous run left behind.
+    ///
+    /// Call once at startup, before anything else. A record still present means the last
+    /// shutdown did not end the way it intended.
+    pub fn take_previous_record(&self) -> Option<RawRecord> {
+        let guard = self.data_dir.lock().ok()?;
+        let dir = guard.as_ref()?;
+        ShutdownRecord::take(dir)
     }
 
     pub fn budgets(&self) -> Budgets {
@@ -296,9 +394,14 @@ impl Lifecycle {
         self.stopping.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Registers a hook.
+    ///
+    /// The closure receives a [`Progress`] handle. Using it is optional but strongly
+    /// encouraged for anything with more than one phase: it is the difference between a log
+    /// that names a module and one that names a step.
     pub async fn register<F, Fut>(&self, spec: HookSpec, action: F)
     where
-        F: Fn() -> Fut + Send + Sync + 'static,
+        F: Fn(Progress) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
         self.hooks.lock().await.push(Hook {
@@ -307,7 +410,7 @@ impl Lifecycle {
             need: spec.need,
             budget: spec.budget,
             optional: spec.optional,
-            action: Box::new(move || Box::pin(action())),
+            action: Box::new(move |progress| Box::pin(action(progress))),
         });
     }
 
@@ -329,10 +432,16 @@ impl Lifecycle {
             return Vec::new();
         }
 
+        if let Ok(mut guard) = self.progress_so_far.lock() {
+            guard.clear();
+        }
         let watchdog = Watchdog::arm(
             self.budgets.watchdog,
             self.watchdog_action,
             self.watchdog_fired.clone(),
+            self.data_dir.lock().ok().and_then(|guard| guard.clone()),
+            self.progress_so_far.clone(),
+            reason,
         );
         let started = Instant::now();
         crate::tprintln!("[lifecycle] stopping ({reason:?})");
@@ -379,19 +488,47 @@ impl Lifecycle {
                         elapsed: Duration::ZERO,
                         budget: hook.budget,
                         result: HookResult::Skipped(reason),
+                        needs_verification: false,
                     });
                 }
                 crate::tprintln!("[lifecycle] {} tier skipped ({reason})", tier.label());
                 continue;
             }
 
-            outcomes.extend(run_tier(tier, tier_hooks, self.budgets).await);
+            let tier_outcomes = run_tier(tier, tier_hooks, self.budgets).await;
+            if let Ok(mut guard) = self.progress_so_far.lock() {
+                guard.extend(tier_outcomes.iter().cloned());
+            }
+            outcomes.extend(tier_outcomes);
+
+            // Production hard-exits when the watchdog fires. Report mode has to model that or
+            // the bench sits through work the real daemon would never have reached, and the
+            // measured total bears no relation to what would actually happen.
+            if self.watchdog_action == WatchdogAction::Report && self.watchdog_fired() {
+                crate::teprintln!(
+                    "[lifecycle] watchdog fired; abandoning the remaining tiers as a hard exit would"
+                );
+                break;
+            }
         }
 
         let elapsed = started.elapsed();
         watchdog.disarm();
 
         report(&outcomes, elapsed);
+
+        // Written whether or not anything went wrong: a clean record is deleted immediately
+        // below, and its absence is itself the signal that the last shutdown was fine.
+        if let Ok(guard) = self.data_dir.lock() {
+            if let Some(dir) = guard.as_ref() {
+                let record = ShutdownRecord::build(reason, false, elapsed, &outcomes);
+                if record.is_clean() {
+                    let _ = std::fs::remove_file(dir.join("last-shutdown.json"));
+                } else {
+                    record.write(dir);
+                }
+            }
+        }
         if self.collect_timings.load(std::sync::atomic::Ordering::Relaxed) {
             emit_timing_report(&outcomes, elapsed);
         }
@@ -515,36 +652,84 @@ async fn run_tier(tier: Tier, hooks: Vec<Hook>, budgets: Budgets) -> Vec<HookOut
     let tier_budget = budgets.for_tier(tier);
     let mut set = JoinSet::new();
 
+    // Recorded up front: once a hook is moved into the JoinSet its identity is gone, and the
+    // abandonment path below needs to know who never reported.
+    // A Progress handle per hook, held by both the hook and the tier. The tier keeps its copy
+    // so an abandoned hook's last reported step can still be read after its future is gone.
+    let progress: Vec<(String, Progress)> = hooks
+        .iter()
+        .map(|hook| {
+            let handle = Progress::new(if hook.detail.is_empty() { "starting" } else { &hook.detail });
+            (hook.module.clone(), handle)
+        })
+        .collect();
+
+    let expected: Vec<(String, Progress, Duration)> = hooks
+        .iter()
+        .zip(progress.iter())
+        .map(|(hook, (_, handle))| {
+            (hook.module.clone(), handle.clone(), hook.budget.min(tier_budget))
+        })
+        .collect();
+
     for hook in hooks {
         // Never let a hook's own budget exceed its tier's, or a single module could consume
         // the whole tier and starve its neighbours out of their share.
         let hook_budget = hook.budget.min(tier_budget);
         let module = hook.module.clone();
-        let detail = hook.detail.clone();
+        let handle = progress
+            .iter()
+            .find(|(name, _)| name == &module)
+            .map(|(_, handle)| handle.clone())
+            .unwrap_or_else(|| Progress::new("starting"));
+        let reporter = handle.clone();
         let action = hook.action;
 
-        set.spawn(async move {
+        // spawn_blocking rather than spawn: hooks run on the blocking pool, which is separate
+        // from the worker threads. A hook that blocks its thread then starves nothing, so the
+        // timers supervising it keep being polled and its neighbours keep running.
+        //
+        // Handle::block_on is legal here because a blocking-pool thread is not an async
+        // context. Doing this on a worker thread would panic, which is precisely the
+        // distinction that matters.
+        let runtime = tokio::runtime::Handle::current();
+        set.spawn_blocking(move || {
             let started = Instant::now();
-            let result = match timeout(hook_budget, action()).await {
-                Ok(Ok(())) => HookResult::Ok,
-                Ok(Err(error)) => HookResult::Failed(error),
-                Err(_) => HookResult::Overran,
+            let outcome = runtime.block_on(async {
+                match timeout(hook_budget, action(reporter)).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(HookResult::Failed(error)),
+                    Err(_) => Some(HookResult::Overran),
+                }
+            });
+            let elapsed = started.elapsed();
+
+            // A completed future is not the same as a hook that behaved. If it could not be
+            // cancelled - because it blocked rather than awaited - `timeout` returns success
+            // once it finally finishes, and the budget it blew through goes unrecorded.
+            // Judging on measured time closes that hole regardless of why the timeout missed.
+            let result = match outcome {
+                Some(result) => result,
+                None if elapsed > hook_budget => HookResult::Overran,
+                None => HookResult::Ok,
             };
+
             HookOutcome {
                 module,
-                detail,
+                detail: handle.read(),
                 tier,
-                elapsed: started.elapsed(),
+                elapsed,
                 budget: hook_budget,
                 result,
+                needs_verification: handle.verification_needed(),
             }
         });
     }
 
     let mut outcomes = Vec::new();
     // The tier ceiling is a second line of defence. Per-hook timeouts should make it
-    // unreachable, but a hook that blocks its worker thread outright cannot be timed out from
-    // inside the runtime, and this at least stops the tier from waiting forever.
+    // unreachable, but a hook that blocks its worker thread cannot be timed out from inside
+    // the runtime at all - the timeout future queues behind the very thing it should cancel.
     match timeout(tier_budget, async {
         while let Some(joined) = set.join_next().await {
             match joined {
@@ -558,11 +743,33 @@ async fn run_tier(tier: Tier, hooks: Vec<Hook>, budgets: Budgets) -> Vec<HookOut
         Ok(()) => {}
         Err(_) => {
             crate::teprintln!(
-                "[lifecycle] {} tier exceeded its {}s ceiling; abandoning outstanding hooks",
+                "[lifecycle] {} tier exceeded its {}ms ceiling; abandoning outstanding hooks",
                 tier.label(),
-                tier_budget.as_secs()
+                tier_budget.as_millis()
             );
             set.abort_all();
+
+            // Anything that never reported is Overran, recorded here rather than left to
+            // report Ok whenever it eventually finishes. A hook that blew its budget many
+            // times over must never appear in the summary as a success - that is the failure
+            // that makes a green run untrustworthy.
+            let reported: std::collections::BTreeSet<String> =
+                outcomes.iter().map(|outcome| outcome.module.clone()).collect();
+            for (module, handle, budget) in expected {
+                if !reported.contains(&module) {
+                    outcomes.push(HookOutcome {
+                        module,
+                        // Read from the handle the tier kept, not from the hook: the hook's
+                        // future has been dropped and everything it owned went with it.
+                        detail: handle.read(),
+                        tier,
+                        elapsed: tier_budget,
+                        budget,
+                        result: HookResult::Overran,
+                        needs_verification: handle.verification_needed(),
+                    });
+                }
+            }
         }
     }
 
@@ -582,9 +789,17 @@ fn report(outcomes: &[HookOutcome], elapsed: Duration) {
     // The point of the whole exercise: the next hang names its own cause.
     for outcome in &overran {
         crate::teprintln!(
-            "[lifecycle] {} exceeded its {}ms budget and was abandoned",
+            "[lifecycle] {} exceeded its {}ms budget and was abandoned while {}",
             outcome.module,
-            outcome.budget.as_millis()
+            outcome.budget.as_millis(),
+            outcome.detail
+        );
+    }
+    for outcome in outcomes.iter().filter(|o| o.needs_verification) {
+        crate::teprintln!(
+            "[lifecycle] {} was interrupted somewhere it considers unsafe ({}); it should verify its own state on the next start",
+            outcome.module,
+            outcome.detail
         );
     }
     for outcome in &failed {
@@ -642,6 +857,9 @@ impl Watchdog {
         limit: Duration,
         action: WatchdogAction,
         fired: Arc<std::sync::atomic::AtomicBool>,
+        data_dir: Option<std::path::PathBuf>,
+        progress: Arc<std::sync::Mutex<Vec<HookOutcome>>>,
+        reason: StopReason,
     ) -> Self {
         let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = disarmed.clone();
@@ -659,6 +877,18 @@ impl Watchdog {
                     return;
                 }
                 fired.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                // The important copy. A shutdown that completed cleanly is the one nobody
+                // needs to investigate; this is the one that vanishes without a trace unless
+                // it is written here, before the exit.
+                if let Some(dir) = &data_dir {
+                    let collected = progress
+                        .lock()
+                        .map(|guard| guard.clone())
+                        .unwrap_or_default();
+                    ShutdownRecord::build(reason, true, limit, &collected).write(dir);
+                }
+
                 match action {
                     WatchdogAction::Exit => {
                         eprintln!(
