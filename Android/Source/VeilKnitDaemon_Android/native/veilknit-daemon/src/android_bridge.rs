@@ -221,7 +221,21 @@ pub extern "system" fn Java_com_example_veilknit_1deamon_NativeDaemonBridge_nati
 
             match run_result {
                 Ok(Ok(())) => publish_log("[android] Daemon stopped."),
-                Ok(Err(error)) => publish_log(&format!("[android] Daemon error: {error}")),
+                Ok(Err(error)) => {
+                    let message = error.to_string();
+                    let lower = message.to_ascii_lowercase();
+                    let intentional_stop = STOP_REQUESTED.load(Ordering::SeqCst)
+                        && (lower.contains("stop requested") || lower.contains("interrupted"));
+                    if intentional_stop {
+                        // A user can stop the foreground service while Veilid is still attaching
+                        // or while the main-DHT network probe is running.  Those helpers return an
+                        // Interrupted/stop-requested error to unwind startup quickly; it is not a
+                        // daemon failure and should not turn the Android notification red.
+                        publish_log("[android] Daemon stopped.");
+                    } else {
+                        publish_log(&format!("[android] Daemon error: {message}"));
+                    }
+                }
                 Err(_) => publish_log("[android] Daemon panicked."),
             }
 
@@ -265,17 +279,29 @@ pub extern "system" fn Java_com_example_veilknit_1deamon_NativeDaemonBridge_nati
     _env: EnvUnowned<'_>,
     _class: JClass<'_>,
 ) -> jboolean {
-    if COMMAND_LOOP_READY.load(Ordering::SeqCst) {
-        if send_command("Q".to_string()) {
-            JNI_TRUE
-        } else {
-            JNI_FALSE
-        }
+    // Android stop is an out-of-band cancellation request, not merely another console
+    // command.  Set the flag even after the command loop is ready so startup/network wait
+    // helpers and the command reader all agree that shutdown has been requested.
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+
+    if !RUNNING.load(Ordering::SeqCst) {
+        return JNI_TRUE;
+    }
+
+    // Once the normal command loop is alive, Q preserves the same user-visible path as the
+    // desktop/UI shutdown button.  Before that point, the sentinel can also unblock login or
+    // the first command read.  read_command() checks STOP_REQUESTED first, so either token is
+    // only a wake-up mechanism; the actual cleanup still goes through Lifecycle.
+    let wake_command = if COMMAND_LOOP_READY.load(Ordering::SeqCst) {
+        "Q"
     } else {
-        STOP_REQUESTED.store(true, Ordering::SeqCst);
-        // Unblock a pending login prompt or the first command read.
-        let _ = send_command(STOP_SENTINEL.to_string());
+        STOP_SENTINEL
+    };
+
+    if send_command(wake_command.to_string()) || !RUNNING.load(Ordering::SeqCst) {
         JNI_TRUE
+    } else {
+        JNI_FALSE
     }
 }
 

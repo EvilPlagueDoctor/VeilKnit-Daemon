@@ -252,7 +252,7 @@ pub async fn create_node(
 	std::fs::create_dir_all(&block_store_directory)?;
 
     let config = VeilidConfig {
-        program_name: "veilknit_daemon".into(),
+        program_name: "VeilKnitNode".into(),
         namespace: namespace.clone(),
 
         protected_store: VeilidConfigProtectedStore {

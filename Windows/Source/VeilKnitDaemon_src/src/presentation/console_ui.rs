@@ -154,7 +154,16 @@ pub fn prompt(label: &str) -> Option<String> {
             response: response_tx,
         })
         .ok()?;
-    response_rx.recv().ok()
+    loop {
+        if crate::android_bridge::stop_requested() {
+            return Some(String::new());
+        }
+        match response_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(value) => return Some(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -385,6 +394,14 @@ fn run_dashboard(receiver: Receiver<ConsoleMessage>, status: NetworkStatus) {
 }
 
 fn handle_key(key: KeyEvent, state: &mut DashboardState) {
+    // In raw terminal mode Ctrl-C may arrive as a crossterm key event instead of an OS signal.
+    // Feed it into the exact same host stop flag used by the desktop signal handler / Android
+    // foreground service so the main command prompt wakes and enters Lifecycle shutdown.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        crate::android_bridge::request_stop();
+        state.dirty = true;
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
         state.dirty = true;
         return;

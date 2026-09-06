@@ -2458,11 +2458,11 @@ impl StreamTransportManager {
                 descriptor.version
             )));
         }
-        descriptor
+        let _ = descriptor
             .streamer_main_dht
             .parse::<RecordKey>()
             .map_err(|error| StreamTransportError::InvalidDescriptor(format!("invalid streamer key: {error:?}")))?;
-        descriptor
+        let _ = descriptor
             .commitment_root_record_key
             .parse::<RecordKey>()
             .map_err(|error| StreamTransportError::InvalidDescriptor(format!("invalid commitment root: {error:?}")))?;

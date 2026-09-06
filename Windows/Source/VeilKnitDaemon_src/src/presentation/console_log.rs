@@ -107,6 +107,8 @@ pub(crate) fn utc_timestamp() -> String {
 pub fn stdout_line(args: fmt::Arguments<'_>) {
     let line = format!("[{}] {}", utc_timestamp(), args);
     remember_line(&line);
+    #[cfg(target_os = "android")]
+    crate::android_bridge::publish_log(&line);
     if crate::console_ui::try_log(line.clone()) {
         return;
     }
@@ -118,6 +120,8 @@ pub fn stdout_line(args: fmt::Arguments<'_>) {
 pub fn stderr_line(args: fmt::Arguments<'_>) {
     let line = format!("[{}] [stderr] {}", utc_timestamp(), args);
     remember_line(&line);
+    #[cfg(target_os = "android")]
+    crate::android_bridge::publish_log(&line);
     if crate::console_ui::try_log(line.clone()) {
         return;
     }

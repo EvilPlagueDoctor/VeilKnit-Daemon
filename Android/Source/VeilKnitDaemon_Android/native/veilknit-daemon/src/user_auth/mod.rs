@@ -178,7 +178,7 @@ impl UserSession {
     /// The original default profile intentionally keeps the historical
     /// `store/` location so existing accounts migrate without copying data.
     /// Additional profiles receive isolated encrypted stores.
-    fn store_dir(&self) -> PathBuf {
+    pub(crate) fn store_dir(&self) -> PathBuf {
         if self.network_profile.profile_id == DEFAULT_NETWORK_PROFILE_ID {
             self.user_dir.join("store")
         } else {
@@ -670,7 +670,7 @@ fn clean_key(key: &str) -> String {
         .collect()
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
     let tmp = path.with_extension("tmp");
 
     let mut file = fs::OpenOptions::new()

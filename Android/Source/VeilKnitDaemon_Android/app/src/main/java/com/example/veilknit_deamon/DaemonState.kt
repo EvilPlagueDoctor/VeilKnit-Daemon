@@ -138,6 +138,7 @@ object DaemonStateStore {
                 ready = false,
                 authenticated = false,
                 status = message,
+                lastError = null,
             )
         }
     }
@@ -157,6 +158,30 @@ object DaemonStateStore {
             for (line in lines) {
                 val lower = line.lowercase()
                 when {
+                    !next.ready && "attaching to network" in lower -> {
+                        next = next.copy(status = "Attaching to Veilid: Attaching…")
+                    }
+                    !next.ready && ("attachedfull" in lower || "public_ready=true" in lower) -> {
+                        next = next.copy(status = "Attaching to Veilid: Connected")
+                    }
+                    !next.ready && ("restoring" in lower || "saved dht" in lower) -> {
+                        next = next.copy(status = "Restoring saved network data…")
+                    }
+                    !next.ready && "main dht" in lower && ("creating" in lower || "setup" in lower) -> {
+                        next = next.copy(status = "Creating main DHT…")
+                    }
+                    !next.ready && "main dht is ready" in lower -> {
+                        next = next.copy(status = "Main DHT ready…")
+                    }
+                    !next.ready && ("mailbox controller started" in lower || "starting mailbox" in lower) -> {
+                        next = next.copy(status = "Creating mailbox…")
+                    }
+                    !next.ready && ("app directory ready" in lower || "application services" in lower) -> {
+                        next = next.copy(status = "Preparing application services…")
+                    }
+                    !next.ready && "local application api" in lower -> {
+                        next = next.copy(status = "Starting application connection service…")
+                    }
                     "gui_app_requests_begin" in lower -> {
                         next = next.copy(pendingAppRequests = emptyList())
                     }
@@ -299,6 +324,7 @@ object DaemonStateStore {
                             ready = false,
                             nativeRunning = false,
                             status = "Stopped",
+                            lastError = null,
                         )
                     }
                 }

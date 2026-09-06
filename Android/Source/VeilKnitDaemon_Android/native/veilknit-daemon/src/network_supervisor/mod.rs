@@ -1,13 +1,15 @@
-//! Lifecycle, startup-state, background scheduling, and orderly shutdown for
-//! the network core.
+//! The daemon's network control desk.
 //!
-//! The console is a client of this service boundary. Future IPC/mobile hosts
-//! can consume the same status and event stream without owning networking logic.
+//! `NetworkSupervisor` keeps the easy-to-read big picture: startup stages, whether the network
+//! is attached, background walk scheduling, status/events for the UI, and access to the shared
+//! `Lifecycle` coordinator.
+//!
+//! It does **not** have a separate shutdown engine anymore. Modules register their cleanup with
+//! `Lifecycle`, and the supervisor simply asks Lifecycle to stop them in the safe order. This
+//! keeps the UI/status responsibilities here while leaving shutdown ordering in one place.
 
 use std::{
     collections::BTreeMap,
-    future::Future,
-    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,6 +23,9 @@ use tokio::{
 };
 
 use crate::{
+    lifecycle::{
+        HookOutcome, HookResult, HookSpec, Lifecycle, Progress, Reachability, StopReason,
+    },
     network_events::{
         duration_millis, EventSeverity, NetworkEvent, NetworkEventBus,
         NetworkEventEnvelope, NetworkEventSource, OperationTimer, StartupStage,
@@ -43,6 +48,8 @@ pub const PRESENCE_STALE_AFTER_SECS: u64 = 15 * 60;
 pub const PRESENCE_FUTURE_SKEW_ALLOWANCE_SECS: u64 = 2 * 60;
 pub const ESTABLISHED_HANDSHAKE_REVERIFY_SECS: u64 = 24 * 60 * 60;
 
+/// Limits how many DHT operations the daemon tries to do at once.
+/// Lower values reduce load; higher values can improve throughput on stronger devices.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DhtConcurrencyPolicy {
     pub max_global_operations: usize,
@@ -62,6 +69,7 @@ impl Default for DhtConcurrencyPolicy {
     }
 }
 
+/// Timing rules for "I am still online" presence information.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PresencePolicy {
     pub checkin_interval_secs: u64,
@@ -79,6 +87,7 @@ impl Default for PresencePolicy {
     }
 }
 
+/// Rules used by the automatic network walker to decide when/how far to walk.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WalkSchedulePolicy {
     pub initial_delay_secs: u64,
@@ -152,6 +161,7 @@ impl WalkSchedulePolicy {
     }
 }
 
+/// Very high-level daemon state shown to observers such as the GUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupervisorLifecycle {
     Starting,
@@ -161,6 +171,7 @@ pub enum SupervisorLifecycle {
     Failed,
 }
 
+/// UI-friendly snapshot of one startup stage and how long it took.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartupStageSnapshot {
     pub state: StartupStageState,
@@ -182,6 +193,7 @@ impl Default for StartupStageSnapshot {
     }
 }
 
+/// A copyable/readable summary of the daemon network state at one moment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub lifecycle: SupervisorLifecycle,
@@ -211,19 +223,12 @@ impl NetworkStatus {
     }
 }
 
-type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
-type ShutdownAction = Box<dyn FnOnce() -> ShutdownFuture + Send + 'static>;
-
-struct ShutdownHook {
-    name: String,
-    action: Option<ShutdownAction>,
-}
-
+/// Shared owner of status/events/policies plus a handle to the single Lifecycle coordinator.
 #[derive(Clone)]
 pub struct NetworkSupervisor {
     events: NetworkEventBus,
     status: Arc<RwLock<NetworkStatus>>,
-    shutdown_hooks: Arc<Mutex<Vec<ShutdownHook>>>,
+    lifecycle: Lifecycle,
     startup_started: Instant,
     dht_policy: DhtConcurrencyPolicy,
     presence_policy: PresencePolicy,
@@ -241,6 +246,7 @@ impl Default for NetworkSupervisor {
 }
 
 impl NetworkSupervisor {
+    /// Builds a supervisor with the policies that control DHT load, presence, and auto-walking.
     pub fn new(
         dht_policy: DhtConcurrencyPolicy,
         presence_policy: PresencePolicy,
@@ -249,7 +255,7 @@ impl NetworkSupervisor {
         Self {
             events: NetworkEventBus::default(),
             status: Arc::new(RwLock::new(NetworkStatus::new())),
-            shutdown_hooks: Arc::new(Mutex::new(Vec::new())),
+            lifecycle: Lifecycle::new(),
             startup_started: Instant::now(),
             dht_policy,
             presence_policy,
@@ -257,10 +263,17 @@ impl NetworkSupervisor {
         }
     }
 
+    /// Returns the event broadcaster used by the console/GUI and other observers.
     pub fn event_bus(&self) -> NetworkEventBus {
         self.events.clone()
     }
 
+    /// Returns another handle to the daemon-wide lifecycle coordinator.
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle.clone()
+    }
+
+    /// Subscribes to future supervisor/network events.
     pub fn subscribe(&self) -> broadcast::Receiver<NetworkEventEnvelope> {
         self.events.subscribe()
     }
@@ -277,10 +290,12 @@ impl NetworkSupervisor {
         self.walk_policy
     }
 
+    /// Takes a snapshot of the current high-level network/startup status.
     pub async fn status(&self) -> NetworkStatus {
         self.status.read().await.clone()
     }
 
+    /// Marks a startup stage as running and returns a timer used to finish that stage later.
     pub async fn stage_running(
         &self,
         stage: StartupStage,
@@ -314,6 +329,7 @@ impl NetworkSupervisor {
         }
     }
 
+    /// Common bookkeeping used when a startup stage finishes successfully, fails, or is skipped.
     async fn finish_stage(
         &self,
         stage: StartupStage,
@@ -349,6 +365,7 @@ impl NetworkSupervisor {
         );
     }
 
+    /// Updates the supervisor's simple "attached or not" view and tells UI/event listeners.
     pub async fn set_network_attachment(&self, attached: bool, state: impl Into<String>) {
         self.status.write().await.network_attached = attached;
         self.events.emit(
@@ -379,6 +396,7 @@ impl NetworkSupervisor {
         );
     }
 
+    /// Declares startup complete after checking that no required startup stage failed.
     pub async fn mark_ready(&self) -> Result<(), String> {
         let now = crate::types::current_timestamp();
         let mut skipped = Vec::new();
@@ -474,72 +492,118 @@ impl NetworkSupervisor {
         Ok(())
     }
 
-    pub async fn register_shutdown_hook<F, Fut>(&self, name: impl Into<String>, action: F)
+    /// Register a shutdown hook with the lifecycle coordinator while preserving supervisor
+    /// service-stop events for GUI/console clients.
+    pub async fn register_shutdown_hook<F, Fut>(&self, spec: HookSpec, action: F)
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), String>> + Send + 'static,
+        F: Fn(Progress) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
-        self.shutdown_hooks.lock().await.push(ShutdownHook {
-            name: name.into(),
-            action: Some(Box::new(move || Box::pin(action()))),
-        });
+        let events = self.events.clone();
+        let service = spec.module.clone();
+        self.lifecycle
+            .register(spec, move |progress| {
+                let events = events.clone();
+                let service = service.clone();
+                let future = action(progress);
+                async move {
+                    events.emit(
+                        NetworkEventSource::Supervisor,
+                        EventSeverity::Info,
+                        NetworkEvent::ServiceStopping {
+                            service: service.clone(),
+                        },
+                    );
+                    future.await
+                }
+            })
+            .await;
     }
 
-    /// Run registered shutdown hooks in reverse registration order. Register
-    /// the low-level Veilid node first, then higher-level services, so presence
-    /// and persistent state are flushed before the API is detached.
-    pub async fn shutdown(&self) -> Vec<(String, Result<(), String>)> {
+    /// The supervisor remains the public status/event facade, but lifecycle is the sole
+    /// shutdown executor. No second hook registry or reverse-registration ordering exists.
+    pub async fn shutdown(&self, reason: StopReason) -> Vec<HookOutcome> {
+        crate::shutdown_debug!("NetworkSupervisor::shutdown ENTER reason={reason:?}");
         {
             let mut status = self.status.write().await;
             if matches!(
                 status.lifecycle,
                 SupervisorLifecycle::Stopping | SupervisorLifecycle::Stopped
-            ) {
+            ) || self.lifecycle.is_stopping()
+            {
                 return Vec::new();
             }
             status.lifecycle = SupervisorLifecycle::Stopping;
             status.stopping_at = Some(crate::types::current_timestamp());
         }
 
-        let mut hooks = {
-            let mut guard = self.shutdown_hooks.lock().await;
-            std::mem::take(&mut *guard)
+        let initial_reachability = if self.status.read().await.network_attached {
+            Reachability::Reachable
+        } else {
+            Reachability::Unreachable
         };
-        hooks.reverse();
+        let refresh = self.clone();
+        crate::shutdown_debug!(
+            "supervisor calling lifecycle.stop; initial_reachability={initial_reachability:?}"
+        );
+        let outcomes = self
+            .lifecycle
+            .stop(reason, initial_reachability, async move {
+                if refresh.status.read().await.network_attached {
+                    Reachability::Reachable
+                } else {
+                    Reachability::Unreachable
+                }
+            })
+            .await;
+        crate::shutdown_debug!(
+            "supervisor returned from lifecycle.stop with {} outcomes",
+            outcomes.len()
+        );
 
-        let mut results = Vec::with_capacity(hooks.len());
-        for mut hook in hooks {
-            self.events.emit(
-                NetworkEventSource::Supervisor,
-                EventSeverity::Info,
-                NetworkEvent::ServiceStopping {
-                    service: hook.name.clone(),
-                },
-            );
-            let timer = OperationTimer::start();
-            let result = match hook.action.take() {
-                Some(action) => action().await,
-                None => Ok(()),
+        for outcome in &outcomes {
+            let error = match &outcome.result {
+                HookResult::Ok | HookResult::Skipped(_) => None,
+                HookResult::Failed(error) => Some(error.clone()),
+                HookResult::Overran => Some(format!(
+                    "shutdown budget exceeded while {}",
+                    outcome.detail
+                )),
             };
             self.events.emit(
                 NetworkEventSource::Supervisor,
-                if result.is_ok() {
-                    EventSeverity::Info
-                } else {
+                if error.is_some() {
                     EventSeverity::Warning
+                } else {
+                    EventSeverity::Info
                 },
                 NetworkEvent::ServiceStopped {
-                    service: hook.name.clone(),
-                    duration_ms: timer.elapsed_ms(),
-                    error: result.as_ref().err().cloned(),
+                    service: outcome.module.clone(),
+                    duration_ms: outcome.elapsed.as_millis().min(u64::MAX as u128) as u64,
+                    error,
                 },
             );
-            results.push((hook.name, result));
         }
 
-        self.status.write().await.lifecycle = SupervisorLifecycle::Stopped;
-        results
+        let had_shutdown_error = outcomes.iter().any(|outcome| {
+            matches!(&outcome.result, HookResult::Failed(_) | HookResult::Overran)
+        });
+        crate::shutdown_debug!(
+            "supervisor final classification inputs: had_shutdown_error={} running_hooks={} watchdog_left_armed={}",
+            had_shutdown_error, self.lifecycle.has_running_hooks(), self.lifecycle.watchdog_left_armed()
+        );
+        self.status.write().await.lifecycle = if had_shutdown_error
+            || self.lifecycle.has_running_hooks()
+            || self.lifecycle.watchdog_left_armed()
+        {
+            SupervisorLifecycle::Failed
+        } else {
+            SupervisorLifecycle::Stopped
+        };
+        crate::shutdown_debug!("NetworkSupervisor::shutdown RETURN");
+        outcomes
     }
+
 }
 
 pub struct StartupStageTimer {
@@ -644,10 +708,38 @@ impl AutoWalkHandle {
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.stop_tx.send(true);
+        crate::shutdown_debug!(
+            "auto-walk scheduler shutdown: sending stop signal"
+        );
+        match self.stop_tx.send(true) {
+            Ok(()) => crate::shutdown_debug!(
+                "auto-walk scheduler shutdown: stop signal sent"
+            ),
+            Err(_) => crate::shutdown_debug!(
+                "auto-walk scheduler shutdown: stop receiver already gone"
+            ),
+        }
+
+        crate::shutdown_debug!(
+            "auto-walk scheduler shutdown: taking scheduler JoinHandle"
+        );
         let task = self.task.lock().await.take();
         if let Some(task) = task {
-            let _ = task.await;
+            crate::shutdown_debug!(
+                "auto-walk scheduler shutdown: awaiting scheduler task"
+            );
+            match task.await {
+                Ok(()) => crate::shutdown_debug!(
+                    "auto-walk scheduler shutdown: scheduler task joined"
+                ),
+                Err(error) => crate::shutdown_debug!(
+                    "auto-walk scheduler shutdown: scheduler task join error: {error}"
+                ),
+            }
+        } else {
+            crate::shutdown_debug!(
+                "auto-walk scheduler shutdown: scheduler JoinHandle already taken"
+            );
         }
     }
 }
@@ -798,43 +890,76 @@ async fn auto_walk_loop(
         );
 
         match walker.start_walk(config).await {
-            Ok(WalkStartResult::Started(handle)) => match handle.wait().await {
-                Ok(report) => {
-                    events.emit(
-                        NetworkEventSource::Walker,
-                        EventSeverity::Notice,
-                        NetworkEvent::WalkFinished {
-                            requested_hops: report.requested_hops,
-                            completed_hops: report.completed_hops,
-                            new_nodes: report.new_nodes,
-                            updated_nodes: report.updated_nodes,
-                            reachable: report.reachable,
-                            unreachable: report.unreachable,
-                            duration_ms: timer.elapsed_ms(),
-                        },
-                    );
+            Ok(WalkStartResult::Started(handle)) => {
+                crate::shutdown_debug!(
+                    "auto-walk scheduler: active walk started; waiting for completion or stop signal"
+                );
 
-                    let discovery_rate = rate(report.new_nodes, report.completed_hops);
-                    if discovery_rate < 0.02 {
-                        low_discovery_streak = low_discovery_streak.saturating_add(1);
-                    } else {
-                        low_discovery_streak = 0;
+                // The old scheduler waited only on `handle.wait()`. If shutdown arrived while a
+                // walk was active, the stop flag could not be observed until that entire walk
+                // finished. Lifecycle then timed the scheduler out after three seconds and,
+                // conservatively, refused to run the later walker shutdown hook. Listen for the
+                // stop signal *while* the walk is running instead. The scheduler requests
+                // cancellation and exits; the dedicated walker hook later proves that the actual
+                // WalkSession task has stopped before Veilid teardown is allowed.
+                let wait_handle = handle.clone();
+                let walk_result = tokio::select! {
+                    result = wait_handle.wait() => Some(result),
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            crate::shutdown_debug!(
+                                "auto-walk scheduler: stop observed during active walk; requesting walk cancellation and exiting scheduler"
+                            );
+                            handle.cancel();
+                            None
+                        } else {
+                            continue;
+                        }
                     }
-                    last_report = Some(report);
-                    last_walk_finished = Some(Instant::now());
+                };
+
+                let Some(walk_result) = walk_result else {
+                    break;
+                };
+
+                match walk_result {
+                    Ok(report) => {
+                        events.emit(
+                            NetworkEventSource::Walker,
+                            EventSeverity::Notice,
+                            NetworkEvent::WalkFinished {
+                                requested_hops: report.requested_hops,
+                                completed_hops: report.completed_hops,
+                                new_nodes: report.new_nodes,
+                                updated_nodes: report.updated_nodes,
+                                reachable: report.reachable,
+                                unreachable: report.unreachable,
+                                duration_ms: timer.elapsed_ms(),
+                            },
+                        );
+
+                        let discovery_rate = rate(report.new_nodes, report.completed_hops);
+                        if discovery_rate < 0.02 {
+                            low_discovery_streak = low_discovery_streak.saturating_add(1);
+                        } else {
+                            low_discovery_streak = 0;
+                        }
+                        last_report = Some(report);
+                        last_walk_finished = Some(Instant::now());
+                    }
+                    Err(error) => {
+                        events.emit(
+                            NetworkEventSource::Walker,
+                            EventSeverity::Warning,
+                            NetworkEvent::WalkFailed {
+                                reason: error.to_string(),
+                                duration_ms: timer.elapsed_ms(),
+                            },
+                        );
+                        last_walk_finished = Some(Instant::now());
+                    }
                 }
-                Err(error) => {
-                    events.emit(
-                        NetworkEventSource::Walker,
-                        EventSeverity::Warning,
-                        NetworkEvent::WalkFailed {
-                            reason: error.to_string(),
-                            duration_ms: timer.elapsed_ms(),
-                        },
-                    );
-                    last_walk_finished = Some(Instant::now());
-                }
-            },
+            }
             Ok(WalkStartResult::AlreadyRunning(_)) => {
                 events.diagnostic(
                     NetworkEventSource::Walker,
@@ -871,6 +996,8 @@ async fn auto_walk_loop(
         );
         next_delay = jittered_and_clamped(&policy, interval_secs, next_mode_settings);
     }
+
+    crate::shutdown_debug!("auto-walk scheduler: loop exited");
 }
 
 fn adaptive_hop_target(
@@ -1022,33 +1149,70 @@ fn all_startup_stages() -> Vec<StartupStage> {
 #[cfg(test)]
 mod shutdown_order_tests {
     use super::NetworkSupervisor;
+    use crate::lifecycle::{HookSpec, ResourceNeed, StopReason};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     #[tokio::test]
-    async fn presence_and_snapshot_run_before_veilid_shutdown() {
+    async fn declared_tiers_place_presence_and_snapshot_before_veilid_shutdown() {
         let supervisor = NetworkSupervisor::default();
+        supervisor.set_network_attachment(true, "test attached").await;
         let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
 
-        for name in ["Veilid", "DHT snapshot", "Presence"] {
+        {
             let order = order.clone();
             supervisor
-                .register_shutdown_hook(name, move || async move {
-                    order.lock().await.push(name);
-                    Ok(())
-                })
+                .register_shutdown_hook(
+                    HookSpec::teardown("Veilid"),
+                    move |_| {
+                        let order = order.clone();
+                        async move {
+                            order.lock().await.push("Veilid");
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+        }
+        {
+            let order = order.clone();
+            supervisor
+                .register_shutdown_hook(
+                    HookSpec::new("DHT snapshot", ResourceNeed::Storage),
+                    move |_| {
+                        let order = order.clone();
+                        async move {
+                            order.lock().await.push("DHT snapshot");
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+        }
+        {
+            let order = order.clone();
+            supervisor
+                .register_shutdown_hook(
+                    HookSpec::new("Presence", ResourceNeed::Network),
+                    move |_| {
+                        let order = order.clone();
+                        async move {
+                            order.lock().await.push("Presence");
+                            Ok(())
+                        }
+                    },
+                )
                 .await;
         }
 
-        let results = supervisor.shutdown().await;
+        let results = supervisor.shutdown(StopReason::Shutdown).await;
         assert_eq!(
-            results.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            results.iter().map(|outcome| outcome.module.as_str()).collect::<Vec<_>>(),
             vec!["Presence", "DHT snapshot", "Veilid"]
         );
-        let observed_order = order.lock().await.clone();
         assert_eq!(
-            observed_order,
-            vec!["Presence", "DHT snapshot", "Veilid"]
+            order.lock().await.as_slice(),
+            ["Presence", "DHT snapshot", "Veilid"]
         );
     }
 }

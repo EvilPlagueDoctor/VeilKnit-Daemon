@@ -76,3 +76,28 @@ Applications should share the signed `StreamDescriptor` using their own room,
 profile, or invitation protocol. Viewers consume `StreamEvent::Data` as live
 bytes and use later `StreamEvent::SegmentVerified` notifications according to
 their latency/integrity policy.
+
+## Account-aware credentials
+
+The SDK now scopes automatically stored application credentials to the daemon's current
+`profile_id`, which is published in `daemon_endpoint.json`.  A normal default installation
+therefore stores credentials conceptually as:
+
+```text
+DaemonNetwork/credentials/<profile_id>/<app_id>.json
+```
+
+This matters when a user signs out of VeilKnit and signs in as another account. The old IPC
+session closes with the old daemon. On the application's next connection attempt the SDK reads
+the new endpoint/profile id and selects the credential belonging to that daemon account. If that
+application has never been approved for the new account, `AuthorizationRequired` is returned and
+a fresh approval request is created.
+
+Credentials from older SDK versions used an unscoped `<app_id>.json` path. For backward
+compatibility, the SDK tries a legacy credential only when no profile-scoped credential exists.
+It migrates that credential into the current profile directory **only after it successfully
+authenticates against the current daemon account**. A credential belonging to another account is
+therefore not copied into the new account's scope.
+
+Applications that provide an explicit `credential_path(...)` continue to own their own storage
+layout and are not automatically profile-scoped.

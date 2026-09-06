@@ -103,6 +103,10 @@ pub struct MailResponseRequest {
 
 pub struct MailboxManager {
     tx: mpsc::Sender<MailboxCommand>,
+    // Out-of-band stop signal.  Unlike MailboxCommand::Shutdown this can be
+    // observed while the single mailbox actor is still awaiting a slow DHT
+    // operation from an earlier command.
+    shutdown_signal: watch::Sender<bool>,
     events: broadcast::Sender<MailboxEvent>,
     snapshot: Arc<RwLock<MailboxPublicSnapshot>>,
 }
@@ -130,13 +134,15 @@ impl MailboxManager {
         let runtime = MailboxRuntime::initialize(init).await?;
         let snapshot = Arc::new(RwLock::new(runtime.public_snapshot().await?));
         let (tx, rx) = mpsc::channel(512);
+        let (shutdown_signal, shutdown_rx) = watch::channel(false);
         let (events, _) = broadcast::channel(256);
         let manager = Arc::new(Self {
             tx,
+            shutdown_signal,
             events: events.clone(),
             snapshot: snapshot.clone(),
         });
-        tokio::spawn(mailbox_actor(rx, runtime, events, snapshot));
+        tokio::spawn(mailbox_actor(rx, shutdown_rx, runtime, events, snapshot));
         Ok(manager)
     }
 
@@ -358,12 +364,33 @@ impl MailboxManager {
     }
 
     pub async fn shutdown(&self) -> Result<(), MailboxError> {
+        crate::shutdown_debug!("mailbox manager: shutdown requested; broadcasting out-of-band stop signal");
+        let started = std::time::Instant::now();
+
+        // The normal command channel cannot interrupt a command which the
+        // mailbox actor is already awaiting.  Set this first so a long walk
+        // observation or maintenance operation can drop its in-flight DHT
+        // future immediately, then queue the ordinary Shutdown command which
+        // performs the final flush and sends the acknowledgement.
+        let _ = self.shutdown_signal.send(true);
+        crate::shutdown_debug!("mailbox manager: out-of-band stop signal sent; queueing Shutdown command");
+
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(MailboxCommand::Shutdown { reply: reply_tx })
             .await
             .map_err(|_| MailboxError::ChannelClosed)?;
-        reply_rx.await.map_err(|_| MailboxError::ChannelClosed)?
+        crate::shutdown_debug!(
+            "mailbox manager: Shutdown command queued after {}ms; awaiting actor reply",
+            started.elapsed().as_millis()
+        );
+        let result = reply_rx.await.map_err(|_| MailboxError::ChannelClosed)?;
+        crate::shutdown_debug!(
+            "mailbox manager: actor replied after {}ms result={}",
+            started.elapsed().as_millis(),
+            if result.is_ok() { "Ok" } else { "Err" }
+        );
+        result
     }
 }
 

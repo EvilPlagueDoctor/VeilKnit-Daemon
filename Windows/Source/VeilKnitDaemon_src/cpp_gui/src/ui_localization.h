@@ -23,6 +23,26 @@ inline const wchar_t* UiLanguageNativeName(UiLanguage language) {
 
 inline const wchar_t* UiText(UiLanguage language, const wchar_t* english) {
     static const UiTranslationRow rows[] = {
+
+    {L"Advanced", L"Avancé", L"Avanzado", L"Расширенный", L"高级"},
+    {L"Simple", L"Simple", L"Simple", L"Упрощённый", L"简化"},
+    {L"Sign in", L"Se connecter", L"Iniciar sesión", L"Войти", L"登录"},
+    {L"The two passwords do not match.", L"Les deux mots de passe ne correspondent pas.", L"Las dos contraseñas no coinciden.", L"Пароли не совпадают.", L"两次输入的密码不一致。"},
+    {L"Check one or more application requests first.", L"Cochez d’abord une ou plusieurs demandes d’application.", L"Marca primero una o más solicitudes de aplicaciones.", L"Сначала отметьте один или несколько запросов приложений.", L"请先勾选一个或多个应用程序请求。"},
+    {L"Active app info", L"Informations sur l’application active", L"Información de la aplicación activa", L"Сведения об активном приложении", L"活动应用信息"},
+    {L"App searches", L"Recherches d’applications", L"Búsquedas de aplicaciones", L"Поиски приложений", L"应用搜索"},
+    {L"Authenticated", L"Authentifié", L"Autenticado", L"Аутентифицирован", L"已认证"},
+    {L"Candidates", L"Candidats", L"Candidatos", L"Кандидаты", L"候选"},
+    {L"Mailbox capable", L"Compatible boîte aux lettres", L"Compatible con buzón", L"Поддерживает почтовый ящик", L"支持邮箱"},
+    {L"New / updated", L"Nouveau / mis à jour", L"Nuevo / actualizado", L"Новые / обновлённые", L"新增 / 已更新"},
+    {L"Not checked", L"Non vérifié", L"Sin comprobar", L"Не проверено", L"未检查"},
+    {L"Offline", L"Hors ligne", L"Sin conexión", L"Не в сети", L"离线"},
+    {L"Presence OK", L"Présence OK", L"Presencia correcta", L"Присутствие в норме", L"在线状态正常"},
+    {L"Reach / fail", L"Joignable / échec", L"Alcance / fallo", L"Доступ / сбой", L"可达 / 失败"},
+    {L"Read failed", L"Lecture échouée", L"Error de lectura", L"Ошибка чтения", L"读取失败"},
+    {L"Root lookups", L"Recherches racine", L"Búsquedas raíz", L"Поиски корня", L"根查询"},
+    {L"Stale claim", L"Annonce périmée", L"Anuncio obsoleto", L"Устаревшее заявление", L"过期声明"},
+    {L"Walk", L"Parcours", L"Recorrido", L"Обход", L"遍历"},
     {L"Discord", L"Discord", L"Discord", L"Discord", L"Discord"},
     {L"Restore backup", L"Restaurer la sauvegarde", L"Restaurar copia", L"Восстановить копию", L"恢复备份"},
     {L"Backup", L"Sauvegarde", L"Copia de seguridad", L"Резервная копия", L"备份"},

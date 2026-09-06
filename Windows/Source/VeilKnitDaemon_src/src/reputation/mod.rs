@@ -618,36 +618,10 @@ pub struct HistoricalSourceSummary {
     pub last_retracted_at: Option<u64>,
 }
 
-// ============================================================================
-// Persistent entry/store
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReputationEntry {
-    subject: RecordKey,
-    summary: ReputationSummary,
-    recent_observations: VecDeque<StoredObservation>,
-
-    /// JSON object keys must be strings. `AuthorityId` is an enum, so this map
-    /// is serialized as an explicit list of `(authority, aggregate)` entries.
-    /// Keeping the in-memory map preserves efficient lookups without repeating
-    /// the mailbox bug where a non-string key failed only after the first item
-    /// was inserted.
-    #[serde(with = "authority_aggregate_map")]
-    historical_by_source: HashMap<AuthorityId, HistoricalAggregate>,
-
-    decisions: Vec<ReputationDecision>,
-    user_override: Option<UserOverrideRecord>,
-    last_touched: u64,
-}
-
-
-/// Serde adapter for maps whose key is a structured authority identity.
-///
-/// `serde_json` can only represent string-keyed objects. Representing this map
-/// as an array also leaves room for future authority variants without inventing
-/// a fragile text encoding.
-mod authority_aggregate_map {
+// JSON object keys must be strings, while AuthorityId is an enum. Persist this
+// map as a sequence of key/value pairs so fresh, unscored peers cannot trigger
+// a repeating persistence failure merely by creating an observation source.
+mod authority_history_map {
     use super::{AuthorityId, HistoricalAggregate};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::HashMap;
@@ -659,7 +633,8 @@ mod authority_aggregate_map {
     where
         S: Serializer,
     {
-        value.iter().collect::<Vec<_>>().serialize(serializer)
+        let entries: Vec<(&AuthorityId, &HistoricalAggregate)> = value.iter().collect();
+        entries.serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(
@@ -672,6 +647,24 @@ mod authority_aggregate_map {
         Ok(entries.into_iter().collect())
     }
 }
+
+// ============================================================================
+// Persistent entry/store
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReputationEntry {
+    subject: RecordKey,
+    summary: ReputationSummary,
+    recent_observations: VecDeque<StoredObservation>,
+    #[serde(with = "authority_history_map")]
+    historical_by_source: HashMap<AuthorityId, HistoricalAggregate>,
+    decisions: Vec<ReputationDecision>,
+    user_override: Option<UserOverrideRecord>,
+    last_touched: u64,
+}
+
+
 
 impl ReputationEntry {
     fn new(subject: RecordKey, now: u64) -> Self {

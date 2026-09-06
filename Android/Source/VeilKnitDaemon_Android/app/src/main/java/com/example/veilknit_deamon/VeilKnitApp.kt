@@ -46,6 +46,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -100,6 +102,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
+private enum class AuthScreen { Choice, SignIn, SignUp }
+
 private enum class AppTab(val title: String, val category: LogCategory) {
     Applications("Applications", LogCategory.Applications),
     Backup("Backup", LogCategory.Overview),
@@ -142,6 +146,12 @@ fun VeilKnitApp() {
                     modifier = Modifier.padding(innerPadding),
                     state = state,
                     snackbarHostState = snackbarHostState,
+                    language = language,
+                    onLanguageChange = {
+                        language = it
+                        UiStrings.current = it
+                        LanguagePreferences.save(context, it)
+                    },
                 )
             }
         }
@@ -158,9 +168,13 @@ private fun LoginScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var screenName by rememberSaveable { mutableStateOf(AuthScreen.Choice.name) }
+    val screen = AuthScreen.valueOf(screenName)
     var username by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
+    var confirmPassword by rememberSaveable { mutableStateOf("") }
     var passwordVisible by rememberSaveable { mutableStateOf(false) }
+
     val restoreLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri ->
@@ -206,6 +220,9 @@ private fun LoginScreen(
             password.isEmpty() || '\n' in password || '\r' in password -> scope.launch {
                 snackbarHostState.showSnackbar(tr("Enter a password without line breaks."))
             }
+            signup && password != confirmPassword -> scope.launch {
+                snackbarHostState.showSnackbar(tr("The two passwords do not match."))
+            }
             else -> {
                 DaemonStateStore.markServiceRunning(
                     if (signup) tr("Creating account…") else tr("Logging in…"),
@@ -217,6 +234,7 @@ private fun LoginScreen(
                     signup = signup,
                 )
                 password = ""
+                confirmPassword = ""
             }
         }
     }
@@ -230,34 +248,37 @@ private fun LoginScreen(
         verticalArrangement = Arrangement.Center,
     ) {
         Card(
-            modifier = Modifier.size(160.dp),
+            modifier = Modifier.size(150.dp),
             colors = CardDefaults.cardColors(containerColor = Color.White),
             shape = RoundedCornerShape(28.dp),
         ) {
             Image(
                 painter = painterResource(R.drawable.veilknit_logo),
                 contentDescription = "VeilKnit logo",
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(10.dp),
+                modifier = Modifier.fillMaxSize().padding(10.dp),
                 contentScale = ContentScale.Fit,
             )
         }
-        Spacer(Modifier.height(22.dp))
+        Spacer(Modifier.height(18.dp))
         Text(
             text = stringResource(R.string.app_name),
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             color = VeilText,
         )
+        Spacer(Modifier.height(4.dp))
         Text(
-            text = tr("Android foreground node") + " • ${stringResource(R.string.instance_name)}",
+            text = when (screen) {
+                AuthScreen.Choice -> tr("Connect your apps to the VeilKnit network")
+                AuthScreen.SignIn -> tr("Sign in")
+                AuthScreen.SignUp -> tr("Create account")
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = VeilMuted,
         )
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
         LanguageSelector(language = language, onLanguageChange = onLanguageChange)
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
 
         if (!NativeDaemonBridge.isLibraryLoaded) {
             WarningCard(
@@ -271,62 +292,96 @@ private fun LoginScreen(
             Spacer(Modifier.height(16.dp))
         }
 
-        OutlinedTextField(
-            value = username,
-            onValueChange = { username = it },
-            label = { Text(tr("Username")) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text(tr("Password")) },
-            singleLine = true,
-            visualTransformation = if (passwordVisible) {
-                VisualTransformation.None
-            } else {
-                PasswordVisualTransformation()
-            },
-            trailingIcon = {
-                IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                    Icon(
-                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff
-                        else Icons.Default.Visibility,
-                        contentDescription = if (passwordVisible) tr("Hide password") else tr("Show password"),
+        when (screen) {
+            AuthScreen.Choice -> {
+                Button(
+                    onClick = { screenName = AuthScreen.SignIn.name },
+                    enabled = NativeDaemonBridge.isLibraryLoaded,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = VeilRed),
+                ) { Text(tr("Sign in")) }
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = { screenName = AuthScreen.SignUp.name },
+                    enabled = NativeDaemonBridge.isLibraryLoaded,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(tr("Create account")) }
+            }
+
+            AuthScreen.SignIn, AuthScreen.SignUp -> {
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text(tr("Username")) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text(tr("Password")) },
+                    singleLine = true,
+                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Icon(
+                                imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (passwordVisible) tr("Hide password") else tr("Show password"),
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                if (screen == AuthScreen.SignUp) {
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = confirmPassword,
+                        onValueChange = { confirmPassword = it },
+                        label = { Text(tr("Confirm password")) },
+                        singleLine = true,
+                        visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
                     )
                 }
-            },
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(18.dp))
-        Button(
-            onClick = { start(signup = false) },
-            enabled = NativeDaemonBridge.isLibraryLoaded,
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = VeilRed),
-        ) {
-            Text(tr("Log in"))
+
+                Spacer(Modifier.height(18.dp))
+                Button(
+                    onClick = { start(signup = screen == AuthScreen.SignUp) },
+                    enabled = NativeDaemonBridge.isLibraryLoaded &&
+                        (screen != AuthScreen.SignUp || (password.isNotEmpty() && password == confirmPassword)),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = VeilRed),
+                ) {
+                    Text(tr(if (screen == AuthScreen.SignUp) "Create account" else "Sign in"))
+                }
+
+                if (screen == AuthScreen.SignIn) {
+                    Spacer(Modifier.height(6.dp))
+                    TextButton(
+                        onClick = { restoreLauncher.launch(arrayOf("application/octet-stream", "application/zip", "*/*")) },
+                        enabled = NativeDaemonBridge.isLibraryLoaded,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(tr("Restore encrypted backup"), color = VeilRed)
+                    }
+                }
+
+                TextButton(
+                    onClick = {
+                        password = ""
+                        confirmPassword = ""
+                        screenName = AuthScreen.Choice.name
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(tr("Back"), color = VeilMuted) }
+            }
         }
-        Spacer(Modifier.height(8.dp))
-        TextButton(
-            onClick = { start(signup = true) },
-            enabled = NativeDaemonBridge.isLibraryLoaded,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(tr("Create account"), color = VeilRed)
-        }
-        TextButton(
-            onClick = { restoreLauncher.launch(arrayOf("application/octet-stream", "application/zip", "*/*")) },
-            enabled = NativeDaemonBridge.isLibraryLoaded,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(tr("Restore encrypted backup"), color = VeilRed)
-        }
-        Spacer(Modifier.height(18.dp))
+
+        Spacer(Modifier.height(14.dp))
         Text(
-            text = tr("The password is passed directly to the in-process Rust daemon and is not stored by the Android UI."),
+            text = tr("Your password is passed directly to the local VeilKnit node and is not stored by the Android interface."),
             style = MaterialTheme.typography.bodySmall,
             color = VeilMuted,
         )
@@ -339,10 +394,43 @@ private fun DaemonScreen(
     modifier: Modifier,
     state: DaemonUiState,
     snackbarHostState: SnackbarHostState,
+    language: UiLanguage,
+    onLanguageChange: (UiLanguage) -> Unit,
 ) {
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var showHelp by rememberSaveable { mutableStateOf(false) }
+    var advancedView by rememberSaveable { mutableStateOf(false) }
+    var languageMenu by remember { mutableStateOf(false) }
+    var approvalPrompt by remember { mutableStateOf<PendingAppRequestUi?>(null) }
+    var promptedRequestIds by remember { mutableStateOf(emptySet<Long>()) }
     val context = LocalContext.current
+
+    // Android cannot safely throw a window on top of an unrelated application without
+    // requesting broad overlay permission. When the daemon UI itself is visible, mirror the
+    // Windows behavior with a normal trusted VeilKnit dialog. When it is in the background,
+    // DaemonForegroundService publishes a heads-up notification with the same Allow/Refuse
+    // actions instead.
+    LaunchedEffect(state.ready, state.pendingAppRequests) {
+        if (!state.ready) {
+            approvalPrompt = null
+            promptedRequestIds = emptySet()
+            return@LaunchedEffect
+        }
+
+        val activeIds = state.pendingAppRequests.map { it.requestId }.toSet()
+        promptedRequestIds = promptedRequestIds.intersect(activeIds)
+        if (approvalPrompt?.requestId !in activeIds) approvalPrompt = null
+
+        if (approvalPrompt == null) {
+            val next = state.pendingAppRequests
+                .filterNot { it.requestId in promptedRequestIds }
+                .maxWithOrNull(compareBy<PendingAppRequestUi> { it.requestedAt }.thenBy { it.requestId })
+            if (next != null) {
+                promptedRequestIds = promptedRequestIds + next.requestId
+                approvalPrompt = next
+            }
+        }
+    }
 
     LaunchedEffect(state.ready) {
         if (state.ready) {
@@ -370,9 +458,7 @@ private fun DaemonScreen(
                 Image(
                     painter = painterResource(R.drawable.veilknit_logo),
                     contentDescription = null,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(3.dp),
+                    modifier = Modifier.fillMaxSize().padding(3.dp),
                     contentScale = ContentScale.Fit,
                 )
             }
@@ -388,7 +474,7 @@ private fun DaemonScreen(
                     StatusDot(state)
                     Spacer(Modifier.width(7.dp))
                     Text(
-                        state.status,
+                        localizedStatus(state.status),
                         style = MaterialTheme.typography.bodySmall,
                         color = VeilMuted,
                         maxLines = 1,
@@ -396,49 +482,134 @@ private fun DaemonScreen(
                     )
                 }
             }
+            Box {
+                IconButton(onClick = { languageMenu = true }) {
+                    Text("🌐", style = MaterialTheme.typography.titleLarge)
+                }
+                DropdownMenu(expanded = languageMenu, onDismissRequest = { languageMenu = false }) {
+                    UiLanguage.entries.forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(option.nativeName) },
+                            onClick = {
+                                languageMenu = false
+                                onLanguageChange(option)
+                            },
+                        )
+                    }
+                }
+            }
             TextButton(onClick = { showHelp = true }) { Text(tr("Help"), color = VeilText) }
             IconButton(onClick = { DaemonForegroundService.stop(context) }) {
                 Icon(
                     Icons.Default.PowerSettingsNew,
-                    contentDescription = "Stop daemon safely",
+                    contentDescription = tr("Stop daemon safely"),
                     tint = VeilRed,
                 )
             }
         }
 
-        ScrollableTabRow(
-            selectedTabIndex = selectedTab,
-            containerColor = VeilPanel,
-            contentColor = VeilRed,
-            edgePadding = 8.dp,
-            divider = { HorizontalDivider(color = VeilBorder) },
-        ) {
-            AppTab.entries.forEachIndexed { index, tab ->
-                Tab(
-                    selected = selectedTab == index,
-                    onClick = { selectedTab = index },
-                    text = { Text(tr(tab.title)) },
+        if (advancedView) {
+            Row(
+                modifier = Modifier.fillMaxWidth().background(VeilPanel).padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = { advancedView = false }) {
+                    Text(tr("Simplified view"), color = VeilRed)
+                }
+                Text(
+                    tr("Advanced view"),
+                    color = VeilMuted,
+                    style = MaterialTheme.typography.bodySmall,
                 )
             }
-        }
-
-        Box(modifier = Modifier.fillMaxSize()) {
-            when (AppTab.entries[selectedTab]) {
-                AppTab.Overview -> OverviewPage(state, snackbarHostState)
-                AppTab.Handshake -> HandshakePage(state, snackbarHostState)
-                AppTab.Network -> NetworkPage(state, snackbarHostState)
-                AppTab.Headers -> HeadersPage(state, snackbarHostState)
-                AppTab.Dht -> DhtPage(state, snackbarHostState)
-                AppTab.Mailbox -> MailboxPage(state, snackbarHostState)
-                AppTab.Applications -> ApplicationsPage(state, snackbarHostState)
-                AppTab.Backup -> BackupPage(state, snackbarHostState)
-                AppTab.Logs -> LogsPage(state.logs)
+            ScrollableTabRow(
+                selectedTabIndex = selectedTab,
+                containerColor = VeilPanel,
+                contentColor = VeilRed,
+                edgePadding = 8.dp,
+                divider = { HorizontalDivider(color = VeilBorder) },
+            ) {
+                AppTab.entries.forEachIndexed { index, tab ->
+                    Tab(
+                        selected = selectedTab == index,
+                        onClick = { selectedTab = index },
+                        text = { Text(tr(tab.title)) },
+                    )
+                }
             }
+
+            Box(modifier = Modifier.fillMaxSize()) {
+                when (AppTab.entries[selectedTab]) {
+                    AppTab.Overview -> OverviewPage(state, snackbarHostState)
+                    AppTab.Handshake -> HandshakePage(state, snackbarHostState)
+                    AppTab.Network -> NetworkPage(state, snackbarHostState)
+                    AppTab.Headers -> HeadersPage(state, snackbarHostState)
+                    AppTab.Dht -> DhtPage(state, snackbarHostState)
+                    AppTab.Mailbox -> MailboxPage(state, snackbarHostState)
+                    AppTab.Applications -> ApplicationsPage(state, snackbarHostState)
+                    AppTab.Backup -> BackupPage(state, snackbarHostState)
+                    AppTab.Logs -> LogsPage(state.logs)
+                }
+            }
+        } else {
+            SimplifiedDaemonPage(
+                state = state,
+                snackbarHostState = snackbarHostState,
+                onAdvanced = { advancedView = true },
+            )
         }
     }
 
+    approvalPrompt?.let { request ->
+        val appName = request.displayName.ifBlank { request.appId }
+        AlertDialog(
+            onDismissRequest = { approvalPrompt = null },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        send(context, "app-approve ${request.requestId}", "app-pending")
+                        approvalPrompt = null
+                    },
+                ) { Text(tr("Allow")) }
+            },
+            dismissButton = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(
+                        onClick = {
+                            send(
+                                context,
+                                "app-reject ${request.requestId} rejected by the local user",
+                                "app-pending",
+                            )
+                            approvalPrompt = null
+                        },
+                    ) { Text(tr("Refuse"), color = VeilRed) }
+                    TextButton(onClick = { approvalPrompt = null }) {
+                        Text(tr("Decide later"), color = VeilMuted)
+                    }
+                }
+            },
+            title = { Text(tr("Connect application to VeilKnit?")) },
+            text = {
+                Column {
+                    Text(
+                        appName + " " + tr("wants permission to connect to your VeilKnit account."),
+                        color = VeilText,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(request.appId, color = VeilMuted, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        tr("Only allow applications you recognize. You can revoke or rotate an application's access later from Applications."),
+                        color = VeilMuted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+        )
+    }
 
-    if (showHelp) {
+    if (showHelp && approvalPrompt == null) {
         AlertDialog(
             onDismissRequest = { showHelp = false },
             confirmButton = { TextButton(onClick = { showHelp = false }) { Text(tr("Got it")) } },
@@ -465,6 +636,139 @@ private fun DaemonScreen(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun SimplifiedDaemonPage(
+    state: DaemonUiState,
+    snackbarHostState: SnackbarHostState,
+    onAdvanced: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    PageColumn {
+        if (!state.ready) {
+            Spacer(Modifier.height(54.dp))
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = VeilRed)
+                    Spacer(Modifier.height(18.dp))
+                    Text(
+                        localizedStatus(state.status),
+                        color = VeilText,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        tr("VeilKnit is preparing your network connection."),
+                        color = VeilMuted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Spacer(Modifier.height(54.dp))
+        } else {
+            InfoCard {
+                Text(
+                    tr("Connected"),
+                    color = VeilSuccess,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    tr("You can now open your VeilKnit app to connect to the network!"),
+                    color = VeilText,
+                )
+            }
+            Spacer(Modifier.height(18.dp))
+        }
+
+        SectionTitle("Application requests")
+        if (!state.ready) {
+            Text(tr("Application requests will appear after the daemon is connected."), color = VeilMuted)
+        } else if (state.pendingAppRequests.isEmpty()) {
+            Text(tr("No pending application requests."), color = VeilMuted)
+        } else {
+            state.pendingAppRequests.forEach { request ->
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    colors = CardDefaults.cardColors(containerColor = VeilPanel),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            request.displayName.ifBlank { request.appId },
+                            color = VeilText,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        if (request.displayName.isNotBlank()) {
+                            Text(request.appId, color = VeilMuted, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        TwoActionRow(
+                            leftText = "Allow",
+                            onLeft = { send(context, "app-approve ${request.requestId}", "app-pending") },
+                            rightText = "Refuse",
+                            onRight = {
+                                send(
+                                    context,
+                                    "app-reject ${request.requestId} rejected by the local user",
+                                    "app-pending",
+                                )
+                            },
+                            enabled = state.ready,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(18.dp))
+        SectionTitle("Observed applications")
+        if (state.foundApps.isEmpty()) {
+            Text(tr("No application advertisements have been observed yet."), color = VeilMuted)
+        } else {
+            state.foundApps.forEach { app ->
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    colors = CardDefaults.cardColors(containerColor = VeilPanel),
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        Text(app.appId, color = VeilText, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            tr("Verified headers") + ": ${app.observedHeaders}   •   " +
+                                tr("Discovery cache") + ": ${app.discoveryCache}",
+                            color = VeilMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(18.dp))
+        TwoActionRow(
+            leftText = "Copy log",
+            onLeft = {
+                val log = state.logs.joinToString("\n")
+                if (log.isBlank()) {
+                    scope.launch { snackbarHostState.showSnackbar(tr("No log lines to copy yet.")) }
+                } else {
+                    copyText(context, "VeilKnit daemon log", log)
+                    scope.launch { snackbarHostState.showSnackbar(tr("Log copied to clipboard.")) }
+                }
+            },
+            rightText = "Disconnect",
+            onRight = { DaemonForegroundService.stop(context) },
+            enabled = state.nativeRunning,
+        )
+        Spacer(Modifier.height(8.dp))
+        TextButton(onClick = onAdvanced, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+            Text(tr("Advanced view"), color = VeilRed)
+        }
     }
 }
 
@@ -743,7 +1047,7 @@ private fun NetworkPage(state: DaemonUiState, snackbarHostState: SnackbarHostSta
         ActionButton("Daemon status", state.ready) { send(context, "D") }
         Spacer(Modifier.height(6.dp))
         Text(
-            "Applied settings are stored in your encrypted daemon account.",
+            tr("Applied settings are stored in your encrypted daemon account."),
             style = MaterialTheme.typography.bodySmall,
             color = VeilMuted,
         )
@@ -1481,7 +1785,7 @@ private fun LogsPage(logs: List<String>) {
             .padding(12.dp),
     ) {
         Text(
-            "All daemon logs",
+            tr("All daemon logs"),
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
         )
@@ -1647,11 +1951,7 @@ private fun looksLikeRecordKey(value: String): Boolean =
 private fun looksLikeLocations(value: String): Boolean =
     Regex("^\\d+(?:-\\d+)?(?:,\\d+(?:-\\d+)?)*$").matches(value.trim())
 
-private fun localizedStatus(value: String): String = when (value) {
-    "Stopped", "Starting…", "Running", "Authenticated; starting network services…",
-    "Authentication failed", "Error", "Waiting for the first header read…" -> tr(value)
-    else -> value
-}
+private fun localizedStatus(value: String): String = tr(value)
 
 
 private fun invalidNumber(

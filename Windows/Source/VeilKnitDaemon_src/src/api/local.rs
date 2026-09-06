@@ -39,6 +39,24 @@ use crate::{
         BlobDescriptor, BlobStoreError, BlobStoreManager, BlobUploadStatus,
         BLOB_MAX_APPEND_BYTES, BLOB_MAX_BYTES,
     },
+    private_app_storage::{
+        PrivateAppStorageManager, PrivateBlobDescriptor, PrivateRetention,
+        PrivateStorageError, PrivateStorageUsage, PrivateValueDescriptor,
+        DEFAULT_PRIVATE_CACHE_LIMIT_BYTES, MAX_EPHEMERAL_TTL_SECS,
+        MAX_PRIVATE_BLOB_APPEND_BYTES, MAX_PRIVATE_BLOB_BYTES,
+        MAX_PRIVATE_BLOB_READ_BYTES, MAX_PRIVATE_VALUE_BYTES, MIN_EPHEMERAL_TTL_SECS,
+    },
+    gossip::{
+        derive_index_tokens, GossipAppStats, GossipConfirmationLevel, GossipError, GossipEvent,
+        GossipFingerprint, GossipFingerprintProbe, GossipIndexToken, GossipManager,
+        GossipProbePolarity, GossipPublishRequest, GossipRecord, GossipSearchHit,
+        GossipSearchQuery, GossipTokenMatchMode, GossipTokenPolarity, GossipTokenProbe,
+        GossipVerificationState, GOSSIP_DEFAULT_NETWORK_WAIT_MS, GOSSIP_DEFAULT_TTL_SECS,
+        GOSSIP_ENGINE_NAMESPACE_STREAMS, GOSSIP_MAX_CUSTOM_PAYLOAD_BYTES,
+        GOSSIP_MAX_FINGERPRINT_BYTES, GOSSIP_MAX_FINGERPRINTS, GOSSIP_MAX_INDEX_PROBES,
+        GOSSIP_MAX_INDEX_TERM_BYTES, GOSSIP_MAX_INDEX_TOKENS, GOSSIP_MAX_QUERY_RESULTS,
+        GOSSIP_MAX_TTL_SECS,
+    },
     stream_transport::{
         same_stream_application_family, StreamDescriptor, StreamEvent,
         StreamSegmentCommitment, StreamSummary,
@@ -54,12 +72,19 @@ use crate::{
         MAX_APP_STORE_WRITE_BYTES_PER_REQUEST, MAX_APP_STORES_PER_APP,
     },
     console_log,
+    lexical_library::{
+        AssociationMetrics, LexicalError, LexicalLibraryManager, LexicalLibraryStats,
+        LexicalObserveRequest, LexicalObserveResult, LexicalSearchResult, WordSimilarity,
+        LEXICAL_ACTIVE_WINDOW_DAYS, LEXICAL_DEFAULT_LAYER, LEXICAL_DEFAULT_LIBRARY_NAME,
+        LEXICAL_MAX_PRETOKENIZED_TERMS, LEXICAL_MAX_SEARCH_TERMS, LEXICAL_MAX_TEXT_BYTES,
+    },
     handshake::HandshakeManager,
     identity_manager::{
         AppAuthResponse, AppCapability, AppCapabilitySet, AppCredential, AppSessionToken, IdentityManager,
     },
     mailbox::{
-        MailboxEvent, MailboxManager, OutgoingMessageRequest, ServiceRequest,
+        CustodianMessageObservation, MailboxEvent, MailboxManager,
+        OutgoingMessageObservationReport, OutgoingMessageRequest, ServiceRequest,
         ServiceRequestPublishRequest,
     },
     network_events::NetworkEventEnvelope,
@@ -69,12 +94,18 @@ use crate::{
         AppId, AppSourceReport, BanScope, DecisionId, ObservationDetails,
         ObservationId, ObservationInput, ObservationKind, ReputationManager, ReputationView,
     },
-    types::{current_timestamp, CAPABILITY_MAILBOX},
+    types::{current_timestamp, CAPABILITY_MAILBOX, USER_PRESENCE_STALE_AFTER_SECS},
     walk_task::{AppSearchStartState, WalkConfig, WalkStartResult, WalkStatus, WalkTask},
 };
 
 pub const LOCAL_API_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_API_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// Ceiling on publishing this app's root record to the directory.
+///
+/// Generous, because a healthy publish on a slow mobile link can take a while, but finite so
+/// that an offline node produces an error the caller can show instead of a hung binder call.
+const APP_ROOT_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const MAX_API_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_APPLICATION_MESSAGES: usize = 16_384;
 const MAX_PENDING_APPLICATION_MESSAGES_PER_APP: usize = 4_096;
@@ -115,6 +146,18 @@ fn default_activity_lease() -> u64 {
 fn default_stream_relay_capacity() -> u16 {
     2
 }
+
+fn default_gossip_network_wait_ms() -> u64 {
+    GOSSIP_DEFAULT_NETWORK_WAIT_MS
+}
+
+fn default_gossip_result_limit() -> usize {
+    24
+}
+
+fn default_lexical_library_name() -> String { LEXICAL_DEFAULT_LIBRARY_NAME.to_string() }
+fn default_lexical_layer() -> String { LEXICAL_DEFAULT_LAYER.to_string() }
+fn default_lexical_window_days() -> u16 { LEXICAL_ACTIVE_WINDOW_DAYS }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -199,6 +242,89 @@ pub enum ApiRequest {
         session_token: String,
         recipient_main_dht: String,
         payload_base64: String,
+    },
+    /// Publish one compact daemon-managed gossip hint for this authenticated
+    /// application. The app id is derived from the session token.
+    PublishGossipObject {
+        session_token: String,
+        object: ApiGossipPublishObject,
+    },
+    WithdrawGossipObject {
+        session_token: String,
+        namespace: String,
+        object_id: String,
+        #[serde(default)]
+        generation: Option<u64>,
+    },
+    SearchGossip {
+        session_token: String,
+        query: ApiGossipSearchQuery,
+        #[serde(default)]
+        query_network: bool,
+        #[serde(default = "default_gossip_network_wait_ms")]
+        network_wait_ms: u64,
+    },
+    ListGossip {
+        session_token: String,
+        #[serde(default)]
+        namespace: Option<String>,
+        #[serde(default = "default_gossip_result_limit")]
+        limit: usize,
+    },
+    ConfirmGossipObject {
+        session_token: String,
+        namespace: String,
+        object_id: String,
+        generation: u64,
+        level: GossipConfirmationLevel,
+        #[serde(default = "default_true")]
+        matches_authoritative: bool,
+    },
+    GetGossipStats {
+        session_token: String,
+    },
+    SubscribeGossip {
+        session_token: String,
+    },
+    /// Feed text or already-separated terms into this app's daemon-owned lexical library.
+    ObserveLexical {
+        session_token: String,
+        #[serde(default = "default_lexical_library_name")] library_name: String,
+        #[serde(default = "default_lexical_layer")] layer: String,
+        object_id: String,
+        generation: u64,
+        field_id: String,
+        #[serde(default)] text: Option<String>,
+        #[serde(default)] terms: Vec<String>,
+        #[serde(default)] authoritative_pointer: Option<String>,
+        #[serde(default = "default_true")] publish_posting_hint: bool,
+    },
+    WithdrawLexicalObject {
+        session_token: String,
+        #[serde(default = "default_lexical_library_name")] library_name: String,
+        object_id: String,
+        #[serde(default)] generation: Option<u64>,
+    },
+    SearchLexical {
+        session_token: String,
+        #[serde(default = "default_lexical_library_name")] library_name: String,
+        #[serde(default = "default_lexical_layer")] layer: String,
+        terms: Vec<String>,
+        #[serde(default = "default_lexical_window_days")] window_days: u16,
+        #[serde(default)] query_network: bool,
+    },
+    CompareLexicalTerms { session_token: String, left: String, right: String },
+    GetLexicalAssociation {
+        session_token: String,
+        #[serde(default = "default_lexical_library_name")] library_name: String,
+        #[serde(default = "default_lexical_layer")] layer: String,
+        left: String,
+        right: String,
+        #[serde(default = "default_lexical_window_days")] window_days: u16,
+    },
+    GetLexicalStats {
+        session_token: String,
+        #[serde(default = "default_lexical_library_name")] library_name: String,
     },
     TriggerMessageRetrieval {
         session_token: String,
@@ -305,6 +431,27 @@ pub enum ApiRequest {
         session_token: String,
         message_id_hex: String,
     },
+    GetNetworkDiagnostics {
+        session_token: String,
+    },
+    StartDiagnosticWalk {
+        session_token: String,
+        hop_count: usize,
+    },
+    PostMailboxProbe {
+        session_token: String,
+        recipient_main_dht: String,
+        payload_base64: String,
+        #[serde(default)]
+        expires_at: Option<u64>,
+    },
+    GetMailboxProbeStatus {
+        session_token: String,
+        message_id_hex: String,
+    },
+    ListMailboxProbeReports {
+        session_token: String,
+    },
     SubscribeMessages {
         session_token: String,
     },
@@ -367,6 +514,42 @@ pub enum ApiRequest {
         #[serde(default)]
         force_refresh: bool,
     },
+
+    // Local-only encrypted app vault. Account/profile and APP_ID are derived from the
+    // authenticated daemon session; callers cannot choose either namespace.
+    PutPrivateValue {
+        session_token: String,
+        key: String,
+        value_base64: String,
+        #[serde(default)]
+        retention: PrivateRetention,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+    },
+    GetPrivateValue { session_token: String, key: String },
+    ListPrivateValues { session_token: String },
+    DeletePrivateValue { session_token: String, key: String },
+    RenewPrivateValue {
+        session_token: String, key: String, retention: PrivateRetention,
+        #[serde(default)] ttl_seconds: Option<u64>,
+    },
+    BeginPrivateBlob {
+        session_token: String, content_type: String,
+        #[serde(default)] retention: PrivateRetention,
+        #[serde(default)] ttl_seconds: Option<u64>,
+    },
+    AppendPrivateBlob { session_token: String, blob_id: String, data_base64: String },
+    FinishPrivateBlob { session_token: String, blob_id: String },
+    AbortPrivateBlob { session_token: String, blob_id: String },
+    ListPrivateBlobs { session_token: String },
+    DeletePrivateBlob { session_token: String, blob_id: String },
+    ReadPrivateBlobRange { session_token: String, blob_id: String, offset: u64, length: u64 },
+    RenewPrivateBlob {
+        session_token: String, blob_id: String, retention: PrivateRetention,
+        #[serde(default)] ttl_seconds: Option<u64>,
+    },
+    GetPrivateStorageUsage { session_token: String },
+
     BeginBlobUpload {
         session_token: String,
         content_type: String,
@@ -506,6 +689,19 @@ impl ApiRequest {
             Self::SubscribeEvents { .. } => "subscribe_events",
             Self::SendMessage { .. } => "send_message",
             Self::SendGossip { .. } => "send_gossip",
+            Self::PublishGossipObject { .. } => "publish_gossip_object",
+            Self::WithdrawGossipObject { .. } => "withdraw_gossip_object",
+            Self::SearchGossip { .. } => "search_gossip",
+            Self::ListGossip { .. } => "list_gossip",
+            Self::ConfirmGossipObject { .. } => "confirm_gossip_object",
+            Self::GetGossipStats { .. } => "get_gossip_stats",
+            Self::SubscribeGossip { .. } => "subscribe_gossip",
+            Self::ObserveLexical { .. } => "observe_lexical",
+            Self::WithdrawLexicalObject { .. } => "withdraw_lexical_object",
+            Self::SearchLexical { .. } => "search_lexical",
+            Self::CompareLexicalTerms { .. } => "compare_lexical_terms",
+            Self::GetLexicalAssociation { .. } => "get_lexical_association",
+            Self::GetLexicalStats { .. } => "get_lexical_stats",
             Self::TriggerMessageRetrieval { .. } => "trigger_message_retrieval",
             Self::GetMailboxStatus { .. } => "get_mailbox_status",
             Self::PublishServiceRequest { .. } => "publish_service_request",
@@ -535,6 +731,20 @@ impl ApiRequest {
             Self::ReadAppStore { .. } => "read_app_store",
             Self::WriteAppStore { .. } => "write_app_store",
             Self::ReadPublicStore { .. } => "read_public_store",
+            Self::PutPrivateValue { .. } => "put_private_value",
+            Self::GetPrivateValue { .. } => "get_private_value",
+            Self::ListPrivateValues { .. } => "list_private_values",
+            Self::DeletePrivateValue { .. } => "delete_private_value",
+            Self::RenewPrivateValue { .. } => "renew_private_value",
+            Self::BeginPrivateBlob { .. } => "begin_private_blob",
+            Self::AppendPrivateBlob { .. } => "append_private_blob",
+            Self::FinishPrivateBlob { .. } => "finish_private_blob",
+            Self::AbortPrivateBlob { .. } => "abort_private_blob",
+            Self::ListPrivateBlobs { .. } => "list_private_blobs",
+            Self::DeletePrivateBlob { .. } => "delete_private_blob",
+            Self::ReadPrivateBlobRange { .. } => "read_private_blob_range",
+            Self::RenewPrivateBlob { .. } => "renew_private_blob",
+            Self::GetPrivateStorageUsage { .. } => "get_private_storage_usage",
             Self::BeginBlobUpload { .. } => "begin_blob_upload",
             Self::AppendBlobUpload { .. } => "append_blob_upload",
             Self::FinishBlobUpload { .. } => "finish_blob_upload",
@@ -557,6 +767,11 @@ impl ApiRequest {
             Self::GetReputationView { .. } => "get_reputation_view",
             Self::GetOwnReputationSubmissions { .. } => "get_own_reputation_submissions",
             Self::SaveSessionLog { .. } => "save_session_log",
+            Self::GetNetworkDiagnostics { .. } => "get_network_diagnostics",
+            Self::StartDiagnosticWalk { .. } => "start_diagnostic_walk",
+            Self::PostMailboxProbe { .. } => "post_mailbox_probe",
+            Self::GetMailboxProbeStatus { .. } => "get_mailbox_probe_status",
+            Self::ListMailboxProbeReports { .. } => "list_mailbox_probe_reports",
         }
     }
 
@@ -564,6 +779,12 @@ impl ApiRequest {
         if matches!(self,
             Self::SendMessage { .. }
                 | Self::SendGossip { .. }
+                | Self::PublishGossipObject { .. }
+                | Self::WithdrawGossipObject { .. }
+                | Self::SearchGossip { query_network: true, .. }
+                | Self::ObserveLexical { .. }
+                | Self::WithdrawLexicalObject { .. }
+                | Self::SearchLexical { query_network: true, .. }
                 | Self::PublishServiceRequest { .. }
                 | Self::SendServiceReply { .. }
                 | Self::AppendBlobUpload { .. }
@@ -583,6 +804,197 @@ impl ApiRequest {
 pub struct ApiStoreWrite {
     pub location: u32,
     pub value_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGossipFingerprintInput {
+    pub channel: String,
+    pub algorithm: String,
+    pub version: u16,
+    pub bytes_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGossipIndexTermsInput {
+    /// Application-chosen token family such as `tags`, `language`, or `capability`.
+    pub index: String,
+    /// Clear text exists only on the local IPC boundary. The daemon normalizes
+    /// and hashes these terms before cache storage or network transmission.
+    pub terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGossipPublishObject {
+    pub namespace: String,
+    pub object_id: String,
+    pub generation: u64,
+    #[serde(default)]
+    pub authoritative_pointer: Option<String>,
+    #[serde(default)]
+    pub fingerprints: Vec<ApiGossipFingerprintInput>,
+    /// Optional exact-search terms. Raw terms are never copied into the gossip record.
+    #[serde(default)]
+    pub indexes: Vec<ApiGossipIndexTermsInput>,
+    #[serde(default)]
+    pub custom_payload_base64: String,
+    #[serde(default)]
+    pub flags: u32,
+    #[serde(default = "default_gossip_ttl_secs")]
+    pub ttl_seconds: u64,
+}
+
+fn default_gossip_ttl_secs() -> u64 {
+    GOSSIP_DEFAULT_TTL_SECS
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGossipFingerprintProbe {
+    pub channel: String,
+    pub algorithm: String,
+    pub version: u16,
+    pub bytes_base64: String,
+    #[serde(default = "default_gossip_probe_weight")]
+    pub weight: u16,
+    #[serde(default = "default_gossip_probe_polarity")]
+    pub polarity: GossipProbePolarity,
+}
+
+fn default_gossip_probe_weight() -> u16 {
+    100
+}
+
+fn default_gossip_probe_polarity() -> GossipProbePolarity {
+    GossipProbePolarity::Similar
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGossipTokenProbeInput {
+    pub index: String,
+    pub terms: Vec<String>,
+    #[serde(default = "default_gossip_token_polarity")]
+    pub polarity: GossipTokenPolarity,
+    #[serde(default = "default_gossip_token_match_mode")]
+    pub match_mode: GossipTokenMatchMode,
+    #[serde(default = "default_gossip_probe_weight")]
+    pub weight: u16,
+}
+
+fn default_gossip_token_polarity() -> GossipTokenPolarity {
+    GossipTokenPolarity::Required
+}
+
+fn default_gossip_token_match_mode() -> GossipTokenMatchMode {
+    GossipTokenMatchMode::All
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiGossipSearchQuery {
+    pub namespace: String,
+    #[serde(default)]
+    pub probes: Vec<ApiGossipFingerprintProbe>,
+    #[serde(default)]
+    pub token_probes: Vec<ApiGossipTokenProbeInput>,
+    #[serde(default = "default_gossip_result_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub min_score_milli: Option<u16>,
+    #[serde(default)]
+    pub include_withdrawn: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiGossipFingerprint {
+    pub channel: String,
+    pub algorithm: String,
+    pub version: u16,
+    pub bytes_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiGossipRecord {
+    pub namespace: String,
+    pub object_id: String,
+    pub generation: u64,
+    pub origin_main_dht: String,
+    pub published_at: u64,
+    pub expires_at: u64,
+    pub authoritative_pointer: Option<String>,
+    pub fingerprints: Vec<ApiGossipFingerprint>,
+    /// Opaque 128-bit digests only; original terms are intentionally not returned.
+    pub index_tokens_hex: Vec<String>,
+    pub custom_payload_base64: String,
+    pub flags: u32,
+    pub withdrawn: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiGossipSearchHit {
+    pub record: ApiGossipRecord,
+    pub score: f32,
+    pub matched_index_tokens: usize,
+    pub verification: GossipVerificationState,
+    pub claimed_source_count: usize,
+    pub conflicting_claim_count: usize,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub last_verified_at: Option<u64>,
+    pub last_verified_generation: Option<u64>,
+}
+
+impl From<GossipRecord> for ApiGossipRecord {
+    fn from(record: GossipRecord) -> Self {
+        Self {
+            namespace: record.namespace,
+            object_id: record.object_id,
+            generation: record.generation,
+            origin_main_dht: record.origin_main_dht,
+            published_at: record.published_at,
+            expires_at: record.expires_at,
+            authoritative_pointer: record.authoritative_pointer,
+            fingerprints: record
+                .fingerprints
+                .into_iter()
+                .map(|fingerprint| ApiGossipFingerprint {
+                    channel: fingerprint.channel,
+                    algorithm: fingerprint.algorithm,
+                    version: fingerprint.version,
+                    bytes_base64: BASE64.encode(fingerprint.bytes),
+                })
+                .collect(),
+            index_tokens_hex: record
+                .index_tokens
+                .into_iter()
+                .map(|token| hex::encode(token.digest))
+                .collect(),
+            custom_payload_base64: BASE64.encode(record.custom_payload),
+            flags: record.flags,
+            withdrawn: record.withdrawn,
+        }
+    }
+}
+
+impl From<GossipSearchHit> for ApiGossipSearchHit {
+    fn from(hit: GossipSearchHit) -> Self {
+        Self {
+            record: hit.record.into(),
+            score: hit.score,
+            matched_index_tokens: hit.matched_index_tokens,
+            verification: hit.verification,
+            claimed_source_count: hit.claimed_source_count,
+            conflicting_claim_count: hit.conflicting_claim_count,
+            first_seen_at: hit.first_seen_at,
+            last_seen_at: hit.last_seen_at,
+            last_verified_at: hit.last_verified_at,
+            last_verified_generation: hit.last_verified_generation,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiGossipEventMessage {
+    pub protocol_version: u16,
+    pub stream: &'static str,
+    pub event: GossipEvent,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -609,6 +1021,67 @@ pub struct ApiErrorBody {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiCustodianObservation {
+    pub custodian_main_dht: String,
+    pub custodian_mailbox_dht: String,
+    pub mailbox_generation: u64,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub trust_weight: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiMailboxObservationReport {
+    pub message_id_hex: String,
+    pub posted_at: u64,
+    pub observations: Vec<ApiCustodianObservation>,
+    pub raw_recent_custodian_count: u32,
+    pub trust_weighted_recent_count: f32,
+    pub first_observation_at: Option<u64>,
+    pub last_observation_at: Option<u64>,
+    pub last_walk_coverage_estimate: f32,
+    pub replication_health_score: f32,
+}
+
+impl From<OutgoingMessageObservationReport> for ApiMailboxObservationReport {
+    fn from(report: OutgoingMessageObservationReport) -> Self {
+        let first_observation_at = report
+            .observations
+            .iter()
+            .map(|observation| observation.first_seen_at)
+            .min();
+        Self {
+            message_id_hex: hex::encode(report.message_id),
+            posted_at: report.posted_at,
+            observations: report
+                .observations
+                .into_iter()
+                .map(ApiCustodianObservation::from)
+                .collect(),
+            raw_recent_custodian_count: report.raw_recent_custodian_count,
+            trust_weighted_recent_count: report.trust_weighted_recent_count,
+            first_observation_at,
+            last_observation_at: report.last_observation_at,
+            last_walk_coverage_estimate: report.last_walk_coverage_estimate,
+            replication_health_score: report.replication_health_score,
+        }
+    }
+}
+
+impl From<CustodianMessageObservation> for ApiCustodianObservation {
+    fn from(observation: CustodianMessageObservation) -> Self {
+        Self {
+            custodian_main_dht: observation.custodian_main_dht.to_string(),
+            custodian_mailbox_dht: observation.custodian_mailbox_dht.to_string(),
+            mailbox_generation: observation.mailbox_generation,
+            first_seen_at: observation.first_seen_at,
+            last_seen_at: observation.last_seen_at,
+            trust_weight: observation.trust_weight,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResult {
@@ -628,8 +1101,27 @@ pub enum ApiResult {
         max_signature_domain_bytes: usize,
         max_blob_append_bytes: usize,
         max_blob_bytes: u64,
+        max_private_value_bytes: usize,
+        max_private_blob_append_bytes: usize,
+        max_private_blob_read_bytes: u64,
+        max_private_blob_bytes: u64,
+        private_ephemeral_ttl_min_seconds: u64,
+        private_ephemeral_ttl_max_seconds: u64,
+        private_cache_limit_bytes: u64,
         max_stream_write_bytes: usize,
         stream_packet_bytes: usize,
+        max_gossip_custom_payload_bytes: usize,
+        max_gossip_fingerprints: usize,
+        max_gossip_fingerprint_bytes: usize,
+        max_gossip_index_tokens: usize,
+        max_gossip_index_term_bytes: usize,
+        max_gossip_index_probe_groups: usize,
+        max_gossip_query_results: usize,
+        max_gossip_ttl_seconds: u64,
+        max_lexical_text_bytes: usize,
+        max_lexical_pretokenized_terms: usize,
+        max_lexical_search_terms: usize,
+        lexical_default_window_days: u16,
     },
     Status {
         status: NetworkStatus,
@@ -691,7 +1183,36 @@ pub enum ApiResult {
         outgoing_service_request_count: usize,
         recent_service_request_count: usize,
         awaiting_response_count: usize,
+        stored_inbox_count: usize,
+        unread_inbox_count: usize,
         known_custodian_count: usize,
+    },
+    NetworkDiagnostics {
+        sampled_at: u64,
+        discovered_total: usize,
+        verified_nodes: usize,
+        candidate_nodes: usize,
+        authenticated_nodes: usize,
+        online_nodes: usize,
+        offline_or_stale_nodes: usize,
+        seen_within_hour: usize,
+        seen_within_day: usize,
+        latest_walk_snapshot_count: usize,
+        known_custodian_count: usize,
+    },
+    DiagnosticWalkStarted {
+        requested_hops: usize,
+        already_running: bool,
+    },
+    MailboxProbeQueued {
+        message_id_hex: String,
+        posted_at: u64,
+    },
+    MailboxProbeStatus {
+        report: Option<ApiMailboxObservationReport>,
+    },
+    MailboxProbeReports {
+        reports: Vec<ApiMailboxObservationReport>,
     },
     KnownNodes {
         sampled_at: u64,
@@ -803,6 +1324,21 @@ pub enum ApiResult {
         record_key: String,
         values: Vec<AppStoreReadValue>,
     },
+    PrivateValueStored { value: PrivateValueDescriptor },
+    PrivateValueRead { value: PrivateValueDescriptor, value_base64: String },
+    PrivateValueMissing { key: String },
+    PrivateValues { values: Vec<PrivateValueDescriptor> },
+    PrivateValueDeleted { key: String, deleted: bool },
+    PrivateValueRenewed { value: PrivateValueDescriptor },
+    PrivateBlobStarted { blob: PrivateBlobDescriptor },
+    PrivateBlobAppended { blob: PrivateBlobDescriptor },
+    PrivateBlobFinished { blob: PrivateBlobDescriptor },
+    PrivateBlobAborted { blob_id: String, aborted: bool },
+    PrivateBlobs { blobs: Vec<PrivateBlobDescriptor> },
+    PrivateBlobDeleted { blob_id: String, deleted: bool },
+    PrivateBlobRangeRead { blob: PrivateBlobDescriptor, offset: u64, data_base64: String },
+    PrivateBlobRenewed { blob: PrivateBlobDescriptor },
+    PrivateStorageUsage { usage: PrivateStorageUsage },
     BlobUploadStarted { upload: BlobUploadStatus },
     BlobUploadAppended { upload: BlobUploadStatus },
     BlobUploadFinished { blob: BlobDescriptor },
@@ -814,6 +1350,35 @@ pub enum ApiResult {
         offset: u64,
         data_base64: String,
     },
+    GossipPublished {
+        hit: ApiGossipSearchHit,
+    },
+    GossipWithdrawn {
+        hit: ApiGossipSearchHit,
+    },
+    GossipSearchResults {
+        query_id_hex: String,
+        network_peers_contacted: usize,
+        hits: Vec<ApiGossipSearchHit>,
+    },
+    GossipObjects {
+        hits: Vec<ApiGossipSearchHit>,
+    },
+    GossipConfirmed {
+        hit: ApiGossipSearchHit,
+    },
+    GossipStats {
+        stats: GossipAppStats,
+    },
+    GossipSubscriptionStarted {
+        app_id: String,
+    },
+    LexicalObserved { result: LexicalObserveResult },
+    LexicalObjectWithdrawn { object_id: String },
+    LexicalSearchResults { result: LexicalSearchResult },
+    LexicalTermComparison { similarity: WordSimilarity },
+    LexicalAssociation { metrics: AssociationMetrics },
+    LexicalStats { stats: LexicalLibraryStats },
     StreamStarted {
         descriptor: StreamDescriptor,
     },
@@ -1718,8 +2283,11 @@ struct LocalApiContext {
     reputation: ReputationManager,
     app_directory: Option<AppDirectoryManager>,
     app_storage: Option<AppStorageManager>,
+    private_storage: Option<PrivateAppStorageManager>,
     blob_store: Option<BlobStoreManager>,
     stream_transport: Option<StreamTransportManager>,
+    gossip: GossipManager,
+    lexical: Option<LexicalLibraryManager>,
     app_signing: Option<AppSigningManager>,
     mailbox: Option<Arc<MailboxManager>>,
     walk_task: Option<WalkTask>,
@@ -1727,6 +2295,7 @@ struct LocalApiContext {
     app_messages: Arc<AppMessageHub>,
     registrations: Arc<AppRegistrationHub>,
     visible_names: AppVisibleNameManager,
+    mailbox_probe_ids: Arc<Mutex<HashMap<String, HashSet<[u8; 32]>>>>,
     backlog: OperationBacklog,
     app_activity: AppActivityHub,
     control_permits: Arc<Semaphore>,
@@ -1742,6 +2311,7 @@ pub struct LocalApiHandle {
     endpoint: String,
     identities: IdentityManager,
     registrations: Arc<AppRegistrationHub>,
+    private_storage: Option<PrivateAppStorageManager>,
     shutdown: watch::Sender<bool>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -1786,7 +2356,16 @@ impl LocalApiHandle {
     }
 
     pub async fn shutdown(&self) {
+        // Stop accepting useful work first, then make DeleteOnShutdown entries unreachable
+        // without waiting for recursive deletion of large chunk trees.
         let _ = self.shutdown.send(true);
+        if let Some(storage) = &self.private_storage {
+            match storage.prepare_shutdown().await {
+                Ok(count) if count > 0 => crate::tprintln!("[private-storage] expired {count} delete-on-shutdown object(s)"),
+                Ok(_) => {},
+                Err(error) => crate::teprintln!("[private-storage] shutdown manifest update failed: {error}"),
+            }
+        }
         let tasks = std::mem::take(&mut *self.tasks.lock().await);
         for task in tasks {
             let _ = task.await;
@@ -1979,8 +2558,11 @@ pub fn spawn_local_api(
     reputation: ReputationManager,
     app_directory: Option<AppDirectoryManager>,
     app_storage: Option<AppStorageManager>,
+    private_storage: Option<PrivateAppStorageManager>,
     blob_store: Option<BlobStoreManager>,
     app_signing: Option<AppSigningManager>,
+    gossip: GossipManager,
+    lexical: Option<LexicalLibraryManager>,
     visible_names: AppVisibleNameManager,
 ) -> io::Result<LocalApiHandle> {
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -2010,8 +2592,11 @@ pub fn spawn_local_api(
         reputation,
         app_directory,
         app_storage,
+        private_storage: private_storage.clone(),
         blob_store,
         stream_transport: stream_transport.clone(),
+        gossip: gossip.clone(),
+        lexical,
         app_signing,
         mailbox,
         walk_task,
@@ -2019,6 +2604,7 @@ pub fn spawn_local_api(
         app_messages,
         registrations: registrations.clone(),
         visible_names,
+        mailbox_probe_ids: Arc::new(Mutex::new(HashMap::new())),
         backlog: backlog.clone(),
         app_activity: app_activity.clone(),
         control_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONTROL_REQUESTS)),
@@ -2034,15 +2620,17 @@ pub fn spawn_local_api(
     let listener_task = tokio::spawn(run_listener(endpoint.clone(), context, shutdown_rx));
     let backlog_task = tokio::spawn(run_backlog_watchdog(backlog, shutdown.subscribe()));
     let activity_task = tokio::spawn(app_activity.run(shutdown.subscribe()));
+    let gossip_task = gossip.spawn_bridge(shutdown.subscribe());
     let stream_task = stream_transport.map(|manager| manager.spawn_bridge(shutdown.subscribe()));
-    let mut tasks = vec![listener_task, backlog_task, activity_task];
-    if let Some(task) = stream_task {
-        tasks.push(task);
-    }
+    let private_storage_task = private_storage.as_ref().map(|manager| manager.spawn_maintenance(shutdown.subscribe()));
+    let mut tasks = vec![listener_task, backlog_task, activity_task, gossip_task];
+    if let Some(task) = stream_task { tasks.push(task); }
+    if let Some(task) = private_storage_task { tasks.push(task); }
     Ok(LocalApiHandle {
         endpoint,
         identities,
         registrations,
+        private_storage,
         shutdown,
         tasks: Arc::new(Mutex::new(tasks)),
     })
@@ -2442,6 +3030,36 @@ where
                 }
             }
         }
+        Ok(ProcessResult::SubscribeGossip { app_id, mut live }) => {
+            write_ok(
+                writer,
+                request_id,
+                ApiResult::GossipSubscriptionStarted {
+                    app_id: app_id.clone(),
+                },
+            )
+            .await?;
+            loop {
+                match live.recv().await {
+                    Ok(event) if event.application_id() == app_id.as_str() => {
+                        write_json_line(
+                            writer,
+                            &ApiGossipEventMessage {
+                                protocol_version: LOCAL_API_PROTOCOL_VERSION,
+                                stream: "gossip_events",
+                                event,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        crate::teprintln!("[api] Gossip subscriber lagged by {skipped} event(s)");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        }
         Ok(ProcessResult::SubscribeStreams { app_id, mut live }) => {
             write_ok(
                 writer,
@@ -2497,6 +3115,10 @@ enum ProcessResult {
         app_id: String,
         live: tokio::sync::broadcast::Receiver<StreamEvent>,
     },
+    SubscribeGossip {
+        app_id: String,
+        live: tokio::sync::broadcast::Receiver<GossipEvent>,
+    },
 }
 
 async fn process_request(
@@ -2512,17 +3134,31 @@ async fn process_request(
             features: vec![
                 "application_messaging",
                 "application_gossip_v1",
+                "daemon_gossip_engine_v2",
+                "gossip_fingerprint_search_v1",
+                "gossip_token_index_v1",
+                "gossip_stream_discovery_v1",
+                "distributed_lexical_library_v1",
+                "lexical_epoch_statistics_v1",
+                "lexical_word_association_v1",
+                "lexical_script_fuzzy_matching_v1",
                 "mailbox_delivery",
                 "delegatable_service_requests_v1",
                 "network_event_stream",
                 "application_signing",
                 "application_owned_dht_storage",
+                "encrypted_private_app_storage_v1",
+                "encrypted_private_chunked_blobs_v1",
+                "private_storage_retention_v1",
                 "public_dht_reads",
                 "known_node_directory",
                 "app_peer_discovery_v1",
                 "app_directory_roots_v1",
                 "persistent_application_inbox",
                 "application_scoped_reputation",
+                "mailbox_probe_diagnostics",
+                "network_topology_diagnostics",
+                "manual_diagnostic_walks",
                 "application_scoped_display_names",
                 "app_node_recommendations",
                 "renewable_app_activity_leases",
@@ -2543,8 +3179,27 @@ async fn process_request(
             max_signature_domain_bytes: MAX_APP_SIGNATURE_DOMAIN_BYTES,
             max_blob_append_bytes: BLOB_MAX_APPEND_BYTES,
             max_blob_bytes: BLOB_MAX_BYTES,
+            max_private_value_bytes: MAX_PRIVATE_VALUE_BYTES,
+            max_private_blob_append_bytes: MAX_PRIVATE_BLOB_APPEND_BYTES,
+            max_private_blob_read_bytes: MAX_PRIVATE_BLOB_READ_BYTES,
+            max_private_blob_bytes: MAX_PRIVATE_BLOB_BYTES,
+            private_ephemeral_ttl_min_seconds: MIN_EPHEMERAL_TTL_SECS,
+            private_ephemeral_ttl_max_seconds: MAX_EPHEMERAL_TTL_SECS,
+            private_cache_limit_bytes: DEFAULT_PRIVATE_CACHE_LIMIT_BYTES,
             max_stream_write_bytes: STREAM_MAX_WRITE_BYTES,
             stream_packet_bytes: STREAM_PACKET_BYTES,
+            max_gossip_custom_payload_bytes: GOSSIP_MAX_CUSTOM_PAYLOAD_BYTES,
+            max_gossip_fingerprints: GOSSIP_MAX_FINGERPRINTS,
+            max_gossip_fingerprint_bytes: GOSSIP_MAX_FINGERPRINT_BYTES,
+            max_gossip_index_tokens: GOSSIP_MAX_INDEX_TOKENS,
+            max_gossip_index_term_bytes: GOSSIP_MAX_INDEX_TERM_BYTES,
+            max_gossip_index_probe_groups: GOSSIP_MAX_INDEX_PROBES,
+            max_gossip_query_results: GOSSIP_MAX_QUERY_RESULTS,
+            max_gossip_ttl_seconds: GOSSIP_MAX_TTL_SECS,
+            max_lexical_text_bytes: LEXICAL_MAX_TEXT_BYTES,
+            max_lexical_pretokenized_terms: LEXICAL_MAX_PRETOKENIZED_TERMS,
+            max_lexical_search_terms: LEXICAL_MAX_SEARCH_TERMS,
+            lexical_default_window_days: LEXICAL_ACTIVE_WINDOW_DAYS,
         })),
         ApiRequest::GetStatus { session_token } => {
             let session = authenticate_token(&context.identities, &session_token).await?;
@@ -2782,6 +3437,178 @@ async fn process_request(
                 message_id_hex: hex::encode(message_id),
             }))
         }
+        ApiRequest::PublishGossipObject { session_token, object } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::SendMessages).map_err(identity_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let request = decode_api_gossip_publish(&app_id, object)?;
+            let hit = context
+                .gossip
+                .publish(&app_id, request)
+                .await
+                .map_err(gossip_error)?;
+            Ok(ProcessResult::Response(ApiResult::GossipPublished {
+                hit: hit.into(),
+            }))
+        }
+        ApiRequest::WithdrawGossipObject {
+            session_token,
+            namespace,
+            object_id,
+            generation,
+        } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::SendMessages).map_err(identity_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let hit = context
+                .gossip
+                .withdraw(&app_id, &namespace, &object_id, generation)
+                .await
+                .map_err(gossip_error)?;
+            Ok(ProcessResult::Response(ApiResult::GossipWithdrawn {
+                hit: hit.into(),
+            }))
+        }
+        ApiRequest::SearchGossip {
+            session_token,
+            query,
+            query_network,
+            network_wait_ms,
+        } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            if query_network {
+                session.require_capability(AppCapability::SendMessages).map_err(identity_error)?;
+            }
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let query = decode_api_gossip_query(&app_id, query)?;
+            let (query_id_hex, network_peers_contacted, hits) = context
+                .gossip
+                .search(&app_id, query, query_network, network_wait_ms)
+                .await
+                .map_err(gossip_error)?;
+            Ok(ProcessResult::Response(ApiResult::GossipSearchResults {
+                query_id_hex,
+                network_peers_contacted,
+                hits: hits.into_iter().map(Into::into).collect(),
+            }))
+        }
+        ApiRequest::ListGossip {
+            session_token,
+            namespace,
+            limit,
+        } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let hits = context
+                .gossip
+                .list_recent(&app_id, namespace.as_deref(), limit)
+                .await
+                .map_err(gossip_error)?;
+            Ok(ProcessResult::Response(ApiResult::GossipObjects {
+                hits: hits.into_iter().map(Into::into).collect(),
+            }))
+        }
+        ApiRequest::ConfirmGossipObject {
+            session_token,
+            namespace,
+            object_id,
+            generation,
+            level,
+            matches_authoritative,
+        } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            // Confirmation records what the application learned after doing its
+            // own authoritative check. It is intentionally not tied to the
+            // legacy `ReadPublicProfiles` capability because gossip namespaces
+            // are generic and may point at rooms, videos, listings, etc.
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let hit = context
+                .gossip
+                .confirm(
+                    &app_id,
+                    &namespace,
+                    &object_id,
+                    generation,
+                    level,
+                    matches_authoritative,
+                )
+                .await
+                .map_err(gossip_error)?;
+            Ok(ProcessResult::Response(ApiResult::GossipConfirmed {
+                hit: hit.into(),
+            }))
+        }
+        ApiRequest::GetGossipStats { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let stats = context.gossip.stats(&app_id).await.map_err(gossip_error)?;
+            Ok(ProcessResult::Response(ApiResult::GossipStats { stats }))
+        }
+        ApiRequest::SubscribeGossip { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            context
+                .gossip
+                .activate_application(&app_id)
+                .await
+                .map_err(gossip_error)?;
+            Ok(ProcessResult::SubscribeGossip {
+                app_id,
+                live: context.gossip.subscribe(),
+            })
+        }
+        ApiRequest::ObserveLexical { session_token, library_name, layer, object_id, generation, field_id, text, terms, authoritative_pointer, publish_posting_hint } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::SendMessages).map_err(identity_error)?;
+            let lexical = context.lexical.as_ref().ok_or_else(|| ("service_unavailable", "lexical library service is unavailable".to_string()))?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let result = lexical.observe(&app_id, LexicalObserveRequest { library_name, layer, object_id, generation, field_id, text, pretokenized_terms: terms, authoritative_pointer, publish_posting_hint }).await.map_err(lexical_error)?;
+            Ok(ProcessResult::Response(ApiResult::LexicalObserved { result }))
+        }
+        ApiRequest::WithdrawLexicalObject { session_token, library_name, object_id, generation } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::SendMessages).map_err(identity_error)?;
+            let lexical = context.lexical.as_ref().ok_or_else(|| ("service_unavailable", "lexical library service is unavailable".to_string()))?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            lexical.withdraw_object(&app_id, &library_name, &object_id, generation).await.map_err(lexical_error)?;
+            Ok(ProcessResult::Response(ApiResult::LexicalObjectWithdrawn { object_id }))
+        }
+        ApiRequest::SearchLexical { session_token, library_name, layer, terms, window_days, query_network } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            if query_network { session.require_capability(AppCapability::SendMessages).map_err(identity_error)?; }
+            let lexical = context.lexical.as_ref().ok_or_else(|| ("service_unavailable", "lexical library service is unavailable".to_string()))?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let result = lexical.search(&app_id, &library_name, &layer, &terms, window_days, query_network).await.map_err(lexical_error)?;
+            Ok(ProcessResult::Response(ApiResult::LexicalSearchResults { result }))
+        }
+        ApiRequest::CompareLexicalTerms { session_token, left, right } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            let lexical = context.lexical.as_ref().ok_or_else(|| ("service_unavailable", "lexical library service is unavailable".to_string()))?;
+            Ok(ProcessResult::Response(ApiResult::LexicalTermComparison { similarity: lexical.compare_terms(&left, &right) }))
+        }
+        ApiRequest::GetLexicalAssociation { session_token, library_name, layer, left, right, window_days } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            let lexical = context.lexical.as_ref().ok_or_else(|| ("service_unavailable", "lexical library service is unavailable".to_string()))?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let metrics = lexical.association_metrics(&app_id, &library_name, &layer, &left, &right, window_days).await.map_err(lexical_error)?;
+            Ok(ProcessResult::Response(ApiResult::LexicalAssociation { metrics }))
+        }
+        ApiRequest::GetLexicalStats { session_token, library_name } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReceiveMessages).map_err(identity_error)?;
+            let lexical = context.lexical.as_ref().ok_or_else(|| ("service_unavailable", "lexical library service is unavailable".to_string()))?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            let stats = lexical.stats(&app_id, &library_name).await.map_err(lexical_error)?;
+            Ok(ProcessResult::Response(ApiResult::LexicalStats { stats }))
+        }
         ApiRequest::TriggerMessageRetrieval { session_token } => {
             let session = authenticate_token(&context.identities, &session_token).await?;
             session
@@ -2820,6 +3647,8 @@ async fn process_request(
                 outgoing_service_request_count: status.outgoing_service_request_count,
                 recent_service_request_count: status.recent_service_request_count,
                 awaiting_response_count: status.awaiting_response_count,
+                stored_inbox_count: status.stored_inbox_count,
+                unread_inbox_count: status.unread_inbox_count,
                 known_custodian_count: status.known_custodian_count,
             }))
         }
@@ -3088,10 +3917,28 @@ async fn process_request(
                 .parse::<RecordKey>()
                 .map_err(|error| ("invalid_record_key", format!("{error:?}")))?;
             let app_id = canonical_application_id(&session.app_id().to_string());
-            let update = manager
-                .set_own_app_root(&app_id, root_dht)
-                .await
-                .map_err(|error| ("app_directory_error", error))?;
+            // Bounded on purpose. This publishes to the app directory DHT, and on a node
+            // that has gone offline the call otherwise never returns - the client is a
+            // blocking binder transaction, so an unbounded await here parks the calling
+            // app's thread indefinitely with no way to recover but a restart.
+            let update = match tokio::time::timeout(
+                APP_ROOT_PUBLISH_TIMEOUT,
+                manager.set_own_app_root(&app_id, root_dht),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|error| ("app_directory_error", error))?,
+                Err(_) => {
+                    //crate::net_health::record_result(Some("TryAgain: offline, try again later"));
+                    return Err((
+                        "app_directory_timeout",
+                        format!(
+                            "publishing the app root did not complete within {} seconds; the node may be offline",
+                            APP_ROOT_PUBLISH_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+            };
             Ok(ProcessResult::Response(ApiResult::AppRootRegistered {
                 app_id: update.app_id,
                 root_dht: update.root_dht.expect("set app root always returns a root").to_string(),
@@ -3441,6 +4288,217 @@ async fn process_request(
                 message_id_hex,
             }))
         }
+        ApiRequest::GetNetworkDiagnostics { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session
+                .require_capability(AppCapability::SubscribeNetworkStatus)
+                .map_err(identity_error)?;
+            let walker = context
+                .walk_task
+                .as_ref()
+                .ok_or_else(|| ("service_unavailable", "network walker is unavailable".to_string()))?;
+            let now = current_timestamp();
+            let list = walker.get_internal_list_copy().await;
+            let verified_nodes = list.entries.len();
+            let candidate_nodes = list.candidates.len();
+            let authenticated_nodes = list
+                .entries
+                .iter()
+                .filter(|entry| entry.verification_state >= NodeVerificationState::Authenticated)
+                .count();
+            let online_nodes = list
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.advertised_online
+                        && entry.last_online != 0
+                        && now.saturating_sub(entry.last_online) <= USER_PRESENCE_STALE_AFTER_SECS
+                })
+                .count();
+            let seen_within_hour = list
+                .entries
+                .iter()
+                .filter(|entry| entry.last_seen != 0 && now.saturating_sub(entry.last_seen) <= 60 * 60)
+                .count();
+            let seen_within_day = list
+                .entries
+                .iter()
+                .filter(|entry| entry.last_seen != 0 && now.saturating_sub(entry.last_seen) <= 24 * 60 * 60)
+                .count();
+            let latest_walk_snapshot_count = walker.last_snapshots().await.len();
+            let known_custodian_count = match &context.mailbox {
+                Some(mailbox) => mailbox
+                    .status()
+                    .await
+                    .map(|status| status.known_custodian_count)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            Ok(ProcessResult::Response(ApiResult::NetworkDiagnostics {
+                sampled_at: now,
+                discovered_total: verified_nodes.saturating_add(candidate_nodes),
+                verified_nodes,
+                candidate_nodes,
+                authenticated_nodes,
+                online_nodes,
+                offline_or_stale_nodes: verified_nodes.saturating_sub(online_nodes),
+                seen_within_hour,
+                seen_within_day,
+                latest_walk_snapshot_count,
+                known_custodian_count,
+            }))
+        }
+        ApiRequest::StartDiagnosticWalk { session_token, hop_count } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session
+                .require_capability(AppCapability::SubscribeNetworkStatus)
+                .map_err(identity_error)?;
+            if !(1..=50).contains(&hop_count) {
+                return Err((
+                    "invalid_hop_count",
+                    "diagnostic hop_count must be between 1 and 50".to_string(),
+                ));
+            }
+            let walker = context
+                .walk_task
+                .as_ref()
+                .ok_or_else(|| ("service_unavailable", "network walker is unavailable".to_string()))?;
+            let config = WalkConfig::random(hop_count)
+                .with_event_reason(format!("manual diagnostic walk for {}", session.app_id()));
+            let already_running = match walker
+                .start_walk(config)
+                .await
+                .map_err(|error| ("walk_failed", error.to_string()))?
+            {
+                WalkStartResult::Started(_) => false,
+                WalkStartResult::AlreadyRunning(_) => true,
+            };
+            Ok(ProcessResult::Response(ApiResult::DiagnosticWalkStarted {
+                requested_hops: hop_count,
+                already_running,
+            }))
+        }
+        ApiRequest::PostMailboxProbe {
+            session_token,
+            recipient_main_dht,
+            payload_base64,
+            expires_at,
+        } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session
+                .require_capability(AppCapability::SendMessages)
+                .map_err(identity_error)?;
+            let recipient_main_dht = recipient_main_dht
+                .parse::<RecordKey>()
+                .map_err(|error| ("invalid_recipient", error.to_string()))?;
+            let plaintext = BASE64
+                .decode(payload_base64.as_bytes())
+                .map_err(|error| ("invalid_payload", error.to_string()))?;
+            if plaintext.len() > MAX_API_MESSAGE_BYTES {
+                return Err((
+                    "message_too_large",
+                    format!("message payload exceeds {} bytes", MAX_API_MESSAGE_BYTES),
+                ));
+            }
+            let mailbox = context
+                .mailbox
+                .as_ref()
+                .ok_or_else(|| ("service_unavailable", "mailbox service is unavailable".to_string()))?;
+            let app_mailbox = mailbox
+                .authenticated_app_handle(&session)
+                .map_err(|error| ("mailbox_auth_failed", error.to_string()))?;
+            let application_id = canonical_application_id(&session.app_id().to_string());
+            let posted_at = current_timestamp();
+            let message_id = app_mailbox
+                .submit_outgoing_message(OutgoingMessageRequest {
+                    application_id: application_id.clone(),
+                    recipient_main_dht: recipient_main_dht.clone(),
+                    plaintext,
+                    expires_at,
+                    conversation_id: None,
+                    proposed_conversation_dht: None,
+                    await_response: false,
+                })
+                .await
+                .map_err(|error| ("mailbox_probe_failed", error.to_string()))?;
+            context
+                .mailbox_probe_ids
+                .lock()
+                .await
+                .entry(application_id.clone())
+                .or_default()
+                .insert(message_id);
+            crate::tprintln!(
+                "[api] Mailbox probe queued: app={} recipient={} message={}",
+                application_id,
+                recipient_main_dht,
+                hex::encode(message_id)
+            );
+            Ok(ProcessResult::Response(ApiResult::MailboxProbeQueued {
+                message_id_hex: hex::encode(message_id),
+                posted_at,
+            }))
+        }
+        ApiRequest::GetMailboxProbeStatus {
+            session_token,
+            message_id_hex,
+        } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session
+                .require_capability(AppCapability::SendMessages)
+                .map_err(identity_error)?;
+            let message_id = decode_fixed::<32>(&message_id_hex, "invalid_message_id")?;
+            let application_id = canonical_application_id(&session.app_id().to_string());
+            let allowed = context
+                .mailbox_probe_ids
+                .lock()
+                .await
+                .get(&application_id)
+                .is_some_and(|ids| ids.contains(&message_id));
+            if !allowed {
+                return Err((
+                    "unknown_probe",
+                    "that mailbox probe was not created by this authenticated app session".to_string(),
+                ));
+            }
+            let mailbox = context
+                .mailbox
+                .as_ref()
+                .ok_or_else(|| ("service_unavailable", "mailbox service is unavailable".to_string()))?;
+            let report = mailbox
+                .observation_report(message_id)
+                .await
+                .map_err(|error| ("mailbox_probe_status_failed", error.to_string()))?
+                .map(ApiMailboxObservationReport::from);
+            Ok(ProcessResult::Response(ApiResult::MailboxProbeStatus { report }))
+        }
+        ApiRequest::ListMailboxProbeReports { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session
+                .require_capability(AppCapability::SendMessages)
+                .map_err(identity_error)?;
+            let application_id = canonical_application_id(&session.app_id().to_string());
+            let ids = context
+                .mailbox_probe_ids
+                .lock()
+                .await
+                .get(&application_id)
+                .cloned()
+                .unwrap_or_default();
+            let mailbox = context
+                .mailbox
+                .as_ref()
+                .ok_or_else(|| ("service_unavailable", "mailbox service is unavailable".to_string()))?;
+            let reports = mailbox
+                .observation_reports()
+                .await
+                .map_err(|error| ("mailbox_probe_status_failed", error.to_string()))?
+                .into_iter()
+                .filter(|report| ids.contains(&report.message_id))
+                .map(ApiMailboxObservationReport::from)
+                .collect();
+            Ok(ProcessResult::Response(ApiResult::MailboxProbeReports { reports }))
+        }
         ApiRequest::SubscribeMessages { session_token } => {
             let session = authenticate_token(&context.identities, &session_token).await?;
             session
@@ -3711,6 +4769,108 @@ async fn process_request(
                 .map_err(app_service_error)?;
             Ok(ProcessResult::Response(ApiResult::PublicStoreRead { record_key, values }))
         }
+        ApiRequest::PutPrivateValue { session_token, key, value_base64, retention, ttl_seconds } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let value = BASE64.decode(value_base64).map_err(|e| ("invalid_private_value", e.to_string()))?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let value = storage.put_value(&session, &key, &value, retention, ttl_seconds).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateValueStored { value }))
+        }
+        ApiRequest::GetPrivateValue { session_token, key } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReadOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            match storage.get_value(&session, &key).await.map_err(private_storage_error)? {
+                Some((value, bytes)) => Ok(ProcessResult::Response(ApiResult::PrivateValueRead { value, value_base64: BASE64.encode(bytes) })),
+                None => Ok(ProcessResult::Response(ApiResult::PrivateValueMissing { key })),
+            }
+        }
+        ApiRequest::ListPrivateValues { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReadOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let values = storage.list_values(&session).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateValues { values }))
+        }
+        ApiRequest::DeletePrivateValue { session_token, key } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let deleted = storage.delete_value(&session, &key).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateValueDeleted { key, deleted }))
+        }
+        ApiRequest::RenewPrivateValue { session_token, key, retention, ttl_seconds } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let value = storage.renew_value(&session, &key, retention, ttl_seconds).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateValueRenewed { value }))
+        }
+        ApiRequest::BeginPrivateBlob { session_token, content_type, retention, ttl_seconds } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let blob = storage.begin_blob(&session, &content_type, retention, ttl_seconds).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobStarted { blob }))
+        }
+        ApiRequest::AppendPrivateBlob { session_token, blob_id, data_base64 } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let data = BASE64.decode(data_base64).map_err(|e| ("invalid_private_blob_data", e.to_string()))?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let blob = storage.append_blob(&session, &blob_id, &data).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobAppended { blob }))
+        }
+        ApiRequest::FinishPrivateBlob { session_token, blob_id } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let blob = storage.finish_blob(&session, &blob_id).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobFinished { blob }))
+        }
+        ApiRequest::AbortPrivateBlob { session_token, blob_id } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let aborted = storage.abort_blob(&session, &blob_id).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobAborted { blob_id, aborted }))
+        }
+        ApiRequest::ListPrivateBlobs { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReadOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let blobs = storage.list_blobs(&session).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobs { blobs }))
+        }
+        ApiRequest::DeletePrivateBlob { session_token, blob_id } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let deleted = storage.delete_blob(&session, &blob_id).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobDeleted { blob_id, deleted }))
+        }
+        ApiRequest::ReadPrivateBlobRange { session_token, blob_id, offset, length } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReadOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let (blob, data) = storage.read_blob_range(&session, &blob_id, offset, length).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobRangeRead { blob, offset, data_base64: BASE64.encode(data) }))
+        }
+        ApiRequest::RenewPrivateBlob { session_token, blob_id, retention, ttl_seconds } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let blob = storage.renew_blob(&session, &blob_id, retention, ttl_seconds).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateBlobRenewed { blob }))
+        }
+        ApiRequest::GetPrivateStorageUsage { session_token } => {
+            let session = authenticate_token(&context.identities, &session_token).await?;
+            session.require_capability(AppCapability::ReadOwnStorage).map_err(identity_error)?;
+            let storage = context.private_storage.as_ref().ok_or_else(|| ("service_unavailable", "private app storage is unavailable".to_string()))?;
+            let usage = storage.usage(&session).await.map_err(private_storage_error)?;
+            Ok(ProcessResult::Response(ApiResult::PrivateStorageUsage { usage }))
+        }
         ApiRequest::BeginBlobUpload { session_token, content_type } => {
             let session = authenticate_token(&context.identities, &session_token).await?;
             session.require_capability(AppCapability::ManageOwnStorage).map_err(identity_error)?;
@@ -3791,6 +4951,14 @@ async fn process_request(
                 "service_unavailable", "stream transport is unavailable".to_string()
             ))?;
             let descriptor = streams.start_stream(&session, metadata).await.map_err(stream_transport_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            if let Err(error) = context
+                .gossip
+                .publish_system_record(&app_id, stream_gossip_record(&descriptor))
+                .await
+            {
+                crate::teprintln!("[stream] Could not publish gossip discovery hint: {error}");
+            }
             Ok(ProcessResult::Response(ApiResult::StreamStarted { descriptor }))
         }
         ApiRequest::JoinStream { session_token, descriptor, relay_capacity } => {
@@ -3845,6 +5013,14 @@ async fn process_request(
                 &stream_id,
                 reason.unwrap_or_else(|| "closed by the source application".to_string()),
             ).await.map_err(stream_transport_error)?;
+            let app_id = canonical_application_id(&session.app_id().to_string());
+            if let Err(error) = context
+                .gossip
+                .withdraw_system(&app_id, GOSSIP_ENGINE_NAMESPACE_STREAMS, &stream_id, None)
+                .await
+            {
+                crate::teprintln!("[stream] Could not withdraw gossip discovery hint: {error}");
+            }
             Ok(ProcessResult::Response(ApiResult::StreamClosed { stream_id }))
         }
         ApiRequest::ListStreams { session_token } => {
@@ -4091,6 +5267,7 @@ fn spawn_application_message_bridges(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 event = gossip_events.recv() => match event {
+                    Ok(message) if crate::gossip::is_engine_frame(&message.payload) => {}
                     Ok(message) => {
                         let (delivery_kind, conversation_id_hex, payload) =
                             match decode_service_reply_payload(&message.payload) {
@@ -4121,6 +5298,155 @@ fn spawn_application_message_bridges(
             }
         }
     });
+}
+
+fn decode_api_gossip_publish(
+    application_id: &str,
+    object: ApiGossipPublishObject,
+) -> Result<GossipPublishRequest, (&'static str, String)> {
+    let mut fingerprints = Vec::with_capacity(object.fingerprints.len());
+    for fingerprint in object.fingerprints {
+        let bytes = BASE64
+            .decode(fingerprint.bytes_base64)
+            .map_err(|error| ("invalid_gossip_fingerprint", error.to_string()))?;
+        fingerprints.push(GossipFingerprint {
+            channel: fingerprint.channel,
+            algorithm: fingerprint.algorithm,
+            version: fingerprint.version,
+            bytes,
+        });
+    }
+    let mut index_tokens: Vec<GossipIndexToken> = Vec::new();
+    for index in &object.indexes {
+        let derived = derive_index_tokens(
+            application_id,
+            &object.namespace,
+            &index.index,
+            index.terms.iter().map(String::as_str),
+        )
+        .map_err(|error| ("invalid_gossip_index", error.to_string()))?;
+        for token in derived {
+            if !index_tokens.contains(&token) {
+                index_tokens.push(token);
+            }
+        }
+        if index_tokens.len() > GOSSIP_MAX_INDEX_TOKENS {
+            return Err((
+                "invalid_gossip_index",
+                format!("at most {GOSSIP_MAX_INDEX_TOKENS} unique index tokens are allowed"),
+            ));
+        }
+    }
+    let custom_payload = if object.custom_payload_base64.is_empty() {
+        Vec::new()
+    } else {
+        BASE64
+            .decode(object.custom_payload_base64)
+            .map_err(|error| ("invalid_gossip_payload", error.to_string()))?
+    };
+    Ok(GossipPublishRequest {
+        namespace: object.namespace,
+        object_id: object.object_id,
+        generation: object.generation,
+        authoritative_pointer: object.authoritative_pointer,
+        fingerprints,
+        index_tokens,
+        custom_payload,
+        flags: object.flags,
+        ttl_seconds: object.ttl_seconds,
+    })
+}
+
+fn decode_api_gossip_query(
+    application_id: &str,
+    query: ApiGossipSearchQuery,
+) -> Result<GossipSearchQuery, (&'static str, String)> {
+    let mut probes = Vec::with_capacity(query.probes.len());
+    for probe in query.probes {
+        let bytes = BASE64
+            .decode(probe.bytes_base64)
+            .map_err(|error| ("invalid_gossip_probe", error.to_string()))?;
+        probes.push(GossipFingerprintProbe {
+            channel: probe.channel,
+            algorithm: probe.algorithm,
+            version: probe.version,
+            bytes,
+            weight: probe.weight,
+            polarity: probe.polarity,
+        });
+    }
+    let mut token_probes = Vec::with_capacity(query.token_probes.len());
+    for probe in query.token_probes {
+        let tokens = derive_index_tokens(
+            application_id,
+            &query.namespace,
+            &probe.index,
+            probe.terms.iter().map(String::as_str),
+        )
+        .map_err(|error| ("invalid_gossip_index", error.to_string()))?;
+        token_probes.push(GossipTokenProbe {
+            tokens,
+            polarity: probe.polarity,
+            match_mode: probe.match_mode,
+            weight: probe.weight,
+        });
+    }
+    Ok(GossipSearchQuery {
+        namespace: query.namespace,
+        probes,
+        token_probes,
+        limit: query.limit,
+        min_score_milli: query.min_score_milli,
+        include_withdrawn: query.include_withdrawn,
+    })
+}
+
+fn lexical_error(error: LexicalError) -> (&'static str, String) {
+    let code = match error {
+        LexicalError::InvalidInput(_) => "invalid_lexical_input",
+        LexicalError::LibraryNotFound => "lexical_library_not_found",
+        LexicalError::Storage(_) => "lexical_storage_error",
+        LexicalError::Dht(_) => "lexical_dht_error",
+        LexicalError::Gossip(_) => "lexical_gossip_error",
+    };
+    (code, error.to_string())
+}
+
+fn gossip_error(error: GossipError) -> (&'static str, String) {
+    let code = match error {
+        GossipError::InvalidApplicationId => "invalid_gossip_application",
+        GossipError::InvalidNamespace | GossipError::ReservedNamespace => "invalid_gossip_namespace",
+        GossipError::InvalidObjectId => "invalid_gossip_object_id",
+        GossipError::InvalidPointer => "invalid_gossip_pointer",
+        GossipError::TooManyFingerprints | GossipError::InvalidFingerprint(_) => "invalid_gossip_fingerprint",
+        GossipError::TooManyIndexTokens | GossipError::InvalidIndex(_) => "invalid_gossip_index",
+        GossipError::CustomPayloadTooLarge => "gossip_payload_too_large",
+        GossipError::InvalidTtl => "invalid_gossip_ttl",
+        GossipError::InvalidQuery(_) => "invalid_gossip_query",
+        GossipError::ObjectNotFound => "gossip_object_not_found",
+        GossipError::GenerationMismatch => "gossip_generation_mismatch",
+        GossipError::NotLocallyPublished => "gossip_object_not_owned",
+        GossipError::Wire(_) => "gossip_wire_error",
+        GossipError::Transport(_) => "gossip_transport_failed",
+    };
+    (code, error.to_string())
+}
+
+fn stream_gossip_record(descriptor: &StreamDescriptor) -> GossipRecord {
+    GossipRecord {
+        namespace: GOSSIP_ENGINE_NAMESPACE_STREAMS.to_string(),
+        object_id: descriptor.stream_id.clone(),
+        generation: descriptor.generation,
+        origin_main_dht: descriptor.streamer_main_dht.clone(),
+        published_at: descriptor.created_at,
+        expires_at: current_timestamp().saturating_add(GOSSIP_MAX_TTL_SECS),
+        authoritative_pointer: Some(descriptor.commitment_root_record_key.clone()),
+        fingerprints: Vec::new(),
+        index_tokens: Vec::new(),
+        custom_payload: Vec::new(),
+        flags: 0,
+        withdrawn: false,
+    }
 }
 
 fn application_message_key(message: &ApiApplicationMessage) -> String {
@@ -4255,6 +5581,10 @@ fn decode_fixed<const N: usize>(
 
 fn identity_error(error: crate::identity_manager::IdentityError) -> (&'static str, String) {
     ("authentication_failed", error.to_string())
+}
+
+fn private_storage_error(error: PrivateStorageError) -> (&'static str, String) {
+    ("private_storage_error", error.to_string())
 }
 
 fn blob_store_error(error: BlobStoreError) -> (&'static str, String) {

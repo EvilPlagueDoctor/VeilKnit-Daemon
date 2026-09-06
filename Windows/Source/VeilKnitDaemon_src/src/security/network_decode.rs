@@ -4,7 +4,7 @@
 //! modules do not accidentally fall back to unrestricted deserialization.
 
 use bincode::Options;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 
 /// Conservative upper bound for a single structured DHT value.
 /// Veilid records used by this project are expected to be far smaller.

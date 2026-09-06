@@ -453,6 +453,61 @@ pub struct PublicStoreRead {
     pub values: Vec<AppStoreValue>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateRetention {
+    Persistent,
+    Cache,
+    Temporary,
+    DeleteOnShutdown,
+}
+
+impl Default for PrivateRetention {
+    fn default() -> Self { Self::Persistent }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateValueDescriptor {
+    pub key: String,
+    pub bytes: u64,
+    pub retention: PrivateRetention,
+    pub expires_at: Option<u64>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_accessed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateBlobDescriptor {
+    pub blob_id: String,
+    pub content_type: String,
+    pub total_bytes: u64,
+    pub chunk_count: usize,
+    pub complete: bool,
+    pub retention: PrivateRetention,
+    pub expires_at: Option<u64>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_accessed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateStorageUsage {
+    pub value_count: usize,
+    pub value_bytes: u64,
+    pub blob_count: usize,
+    pub blob_bytes: u64,
+    pub cache_bytes: u64,
+    pub cache_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrivateBlobRange {
+    pub blob: PrivateBlobDescriptor,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobDescriptor {
     pub blob_id: String,
@@ -1548,6 +1603,229 @@ impl NetworkApiClient {
         }
     }
 
+    /// Store a small, local-only encrypted value in this account + APP_ID vault.
+    pub async fn put_private_value(
+        &self,
+        key: &str,
+        value: &[u8],
+        retention: PrivateRetention,
+        ttl_seconds: Option<u64>,
+    ) -> Result<PrivateValueDescriptor, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "put_private_value",
+            "session_token": self.session.token_hex,
+            "key": key,
+            "value_base64": BASE64.encode(value),
+            "retention": retention,
+            "ttl_seconds": ttl_seconds,
+        })).await? {
+            ApiResult::PrivateValueStored { value } => Ok(value),
+            other => Err(unexpected("private value stored", other)),
+        }
+    }
+
+    pub async fn get_private_value(
+        &self,
+        key: &str,
+    ) -> Result<Option<(PrivateValueDescriptor, Vec<u8>)>, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "get_private_value",
+            "session_token": self.session.token_hex,
+            "key": key,
+        })).await? {
+            ApiResult::PrivateValueRead { value, value_base64 } => Ok(Some((
+                value,
+                BASE64.decode(value_base64).map_err(|e| ClientError::UnexpectedResponse(format!("invalid private value base64: {e}")))?,
+            ))),
+            ApiResult::PrivateValueMissing { .. } => Ok(None),
+            other => Err(unexpected("private value read", other)),
+        }
+    }
+
+    pub async fn list_private_values(&self) -> Result<Vec<PrivateValueDescriptor>, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "list_private_values",
+            "session_token": self.session.token_hex,
+        })).await? {
+            ApiResult::PrivateValues { values } => Ok(values),
+            other => Err(unexpected("private value list", other)),
+        }
+    }
+
+    pub async fn delete_private_value(&self, key: &str) -> Result<bool, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "delete_private_value",
+            "session_token": self.session.token_hex,
+            "key": key,
+        })).await? {
+            ApiResult::PrivateValueDeleted { deleted, .. } => Ok(deleted),
+            other => Err(unexpected("private value delete", other)),
+        }
+    }
+
+    pub async fn renew_private_value(
+        &self,
+        key: &str,
+        retention: PrivateRetention,
+        ttl_seconds: Option<u64>,
+    ) -> Result<PrivateValueDescriptor, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "renew_private_value",
+            "session_token": self.session.token_hex,
+            "key": key,
+            "retention": retention,
+            "ttl_seconds": ttl_seconds,
+        })).await? {
+            ApiResult::PrivateValueRenewed { value } => Ok(value),
+            other => Err(unexpected("private value renewal", other)),
+        }
+    }
+
+    pub async fn begin_private_blob(
+        &self,
+        content_type: &str,
+        retention: PrivateRetention,
+        ttl_seconds: Option<u64>,
+    ) -> Result<PrivateBlobDescriptor, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "begin_private_blob",
+            "session_token": self.session.token_hex,
+            "content_type": content_type,
+            "retention": retention,
+            "ttl_seconds": ttl_seconds,
+        })).await? {
+            ApiResult::PrivateBlobStarted { blob } => Ok(blob),
+            other => Err(unexpected("private blob start", other)),
+        }
+    }
+
+    pub async fn append_private_blob(&self, blob_id: &str, data: &[u8]) -> Result<PrivateBlobDescriptor, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "append_private_blob",
+            "session_token": self.session.token_hex,
+            "blob_id": blob_id,
+            "data_base64": BASE64.encode(data),
+        })).await? {
+            ApiResult::PrivateBlobAppended { blob } => Ok(blob),
+            other => Err(unexpected("private blob append", other)),
+        }
+    }
+
+    pub async fn finish_private_blob(&self, blob_id: &str) -> Result<PrivateBlobDescriptor, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "finish_private_blob",
+            "session_token": self.session.token_hex,
+            "blob_id": blob_id,
+        })).await? {
+            ApiResult::PrivateBlobFinished { blob } => Ok(blob),
+            other => Err(unexpected("private blob finish", other)),
+        }
+    }
+
+    pub async fn abort_private_blob(&self, blob_id: &str) -> Result<bool, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "abort_private_blob",
+            "session_token": self.session.token_hex,
+            "blob_id": blob_id,
+        })).await? {
+            ApiResult::PrivateBlobAborted { aborted, .. } => Ok(aborted),
+            other => Err(unexpected("private blob abort", other)),
+        }
+    }
+
+    pub async fn delete_private_blob(&self, blob_id: &str) -> Result<bool, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "delete_private_blob",
+            "session_token": self.session.token_hex,
+            "blob_id": blob_id,
+        })).await? {
+            ApiResult::PrivateBlobDeleted { deleted, .. } => Ok(deleted),
+            other => Err(unexpected("private blob delete", other)),
+        }
+    }
+
+    pub async fn list_private_blobs(&self) -> Result<Vec<PrivateBlobDescriptor>, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "list_private_blobs",
+            "session_token": self.session.token_hex,
+        })).await? {
+            ApiResult::PrivateBlobs { blobs } => Ok(blobs),
+            other => Err(unexpected("private blob list", other)),
+        }
+    }
+
+    pub async fn read_private_blob_range(
+        &self,
+        blob_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<PrivateBlobRange, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "read_private_blob_range",
+            "session_token": self.session.token_hex,
+            "blob_id": blob_id,
+            "offset": offset,
+            "length": length,
+        })).await? {
+            ApiResult::PrivateBlobRangeRead { blob, offset, data_base64 } => Ok(PrivateBlobRange {
+                blob,
+                offset,
+                data: BASE64.decode(data_base64).map_err(|e| ClientError::UnexpectedResponse(format!("invalid private blob range base64: {e}")))?,
+            }),
+            other => Err(unexpected("private blob range", other)),
+        }
+    }
+
+    pub async fn renew_private_blob(
+        &self,
+        blob_id: &str,
+        retention: PrivateRetention,
+        ttl_seconds: Option<u64>,
+    ) -> Result<PrivateBlobDescriptor, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "renew_private_blob",
+            "session_token": self.session.token_hex,
+            "blob_id": blob_id,
+            "retention": retention,
+            "ttl_seconds": ttl_seconds,
+        })).await? {
+            ApiResult::PrivateBlobRenewed { blob } => Ok(blob),
+            other => Err(unexpected("private blob renewal", other)),
+        }
+    }
+
+    pub async fn private_storage_usage(&self) -> Result<PrivateStorageUsage, ClientError> {
+        match self.request(serde_json::json!({
+            "action": "get_private_storage_usage",
+            "session_token": self.session.token_hex,
+        })).await? {
+            ApiResult::PrivateStorageUsage { usage } => Ok(usage),
+            other => Err(unexpected("private storage usage", other)),
+        }
+    }
+
+    /// Upload an in-memory blob to local encrypted storage in bounded chunks.
+    pub async fn put_private_blob(
+        &self,
+        content_type: &str,
+        data: &[u8],
+        retention: PrivateRetention,
+        ttl_seconds: Option<u64>,
+    ) -> Result<PrivateBlobDescriptor, ClientError> {
+        let started = self.begin_private_blob(content_type, retention, ttl_seconds).await?;
+        let blob_id = started.blob_id.clone();
+        let result = async {
+            for chunk in data.chunks(256 * 1024) {
+                self.append_private_blob(&blob_id, chunk).await?;
+            }
+            self.finish_private_blob(&blob_id).await
+        }.await;
+        if result.is_err() {
+            let _ = self.abort_private_blob(&blob_id).await;
+        }
+        result
+    }
+
     /// Start a resumable opaque-byte upload. The daemon does not inspect or
     /// decode the supplied content type; it is metadata for the application.
     pub async fn begin_blob_upload(&self, content_type: &str) -> Result<BlobUploadStatus, ClientError> {
@@ -2333,6 +2611,7 @@ pub fn default_app_capabilities() -> Vec<AppCapability> {
 pub struct NetworkApp {
     client: Arc<NetworkApiClient>,
     local_user: LocalUser,
+    profile_id: String,
 }
 
 impl NetworkApp {
@@ -2362,11 +2641,12 @@ impl NetworkApp {
             NetworkApiClient::authenticate(&credential, requested_capabilities).await?,
         );
         let identity = client.identity().await?;
+        let profile_id = identity.profile_id;
         let local_user = LocalUser {
             username: identity.username,
             identity: NetworkIdentity::parse(identity.main_dht)?,
         };
-        Ok(Self { client, local_user })
+        Ok(Self { client, local_user, profile_id })
     }
 
     /// The authenticated application's ID.
@@ -2377,6 +2657,13 @@ impl NetworkApp {
     /// The daemon user and opaque network identity.
     pub fn local_user(&self) -> &LocalUser {
         &self.local_user
+    }
+
+    /// Opaque daemon account/network-profile identifier for this authenticated connection.
+    /// Applications can compare this across reconnects to detect an account switch without
+    /// relying on a public username.
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
     }
 
     /// Send bytes to one network identity.
@@ -2778,32 +3065,96 @@ impl NetworkAppBuilder {
             ));
         }
 
-        let credential_path = match &self.credential_path {
-            Some(path) if path.exists() => Some(path.clone()),
-            Some(_) => None,
-            None => find_credential_path(&self.app_id),
+        // Endpoint discovery also tells us which daemon account/profile is currently active.
+        // Credentials are therefore stored under that profile instead of globally by app id.
+        // Switching daemon accounts makes an already-running app authenticate as a completely
+        // different local user rather than accidentally presenting the previous account's key.
+        let discovered = match &self.endpoint {
+            Some(explicit) => discover_endpoint_info()
+                .ok()
+                .filter(|value| value.endpoint == *explicit),
+            None => Some(discover_endpoint_info()?),
         };
-        if let Some(path) = credential_path {
-            let credential = CredentialFile::load(&path)?;
+        let endpoint = self
+            .endpoint
+            .clone()
+            .or_else(|| discovered.as_ref().map(|value| value.endpoint.clone()))
+            .ok_or(ClientError::DaemonEndpointNotFound)?;
+        let profile_id = discovered
+            .as_ref()
+            .map(|value| value.profile_id.trim())
+            .filter(|value| !value.is_empty());
+
+        // An explicitly supplied credential path remains authoritative for applications that
+        // intentionally manage their own credential storage.
+        if let Some(path) = self.credential_path.as_ref().filter(|path| path.exists()) {
+            let credential = CredentialFile::load(path)?;
             if credential.app_id != self.app_id {
                 return Err(ClientError::InvalidCredential(format!(
-                    "credential belongs to {}, not {}",
-                    credential.app_id, self.app_id
+                    "credential belongs to {}, not {}", credential.app_id, self.app_id
                 )));
             }
-            let endpoint_override = self.endpoint.or_else(|| discover_endpoint().ok());
             return NetworkApp::from_credential(
                 credential,
-                endpoint_override,
-                self.capabilities,
+                Some(endpoint.clone()),
+                self.capabilities.clone(),
             )
             .await;
         }
 
-        let endpoint = match self.endpoint.clone() {
-            Some(endpoint) => endpoint,
-            None => discover_endpoint()?,
-        };
+        if self.credential_path.is_none() {
+            if let Some(profile_id) = profile_id {
+                if let Some(path) = find_profile_credential_path(&self.app_id, profile_id) {
+                    let credential = CredentialFile::load(&path)?;
+                    if credential.app_id != self.app_id {
+                        return Err(ClientError::InvalidCredential(format!(
+                            "credential belongs to {}, not {}", credential.app_id, self.app_id
+                        )));
+                    }
+                    return NetworkApp::from_credential(
+                        credential,
+                        Some(endpoint.clone()),
+                        self.capabilities.clone(),
+                    )
+                    .await;
+                }
+
+                // Migration path for credentials created before profile scoping existed.  We only
+                // migrate the legacy credential after it successfully authenticates against the
+                // currently active daemon account. A credential from another account is ignored.
+                if let Some(path) = find_legacy_credential_path(&self.app_id) {
+                    if let Ok(credential) = CredentialFile::load(&path) {
+                        if credential.app_id == self.app_id {
+                            if let Ok(app) = NetworkApp::from_credential(
+                                credential.clone(),
+                                Some(endpoint.clone()),
+                                self.capabilities.clone(),
+                            )
+                            .await
+                            {
+                                let scoped = preferred_profile_credential_path(&self.app_id, profile_id);
+                                credential.save(&scoped)?;
+                                return Ok(app);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(path) = find_legacy_credential_path(&self.app_id) {
+                let credential = CredentialFile::load(&path)?;
+                if credential.app_id != self.app_id {
+                    return Err(ClientError::InvalidCredential(format!(
+                        "credential belongs to {}, not {}", credential.app_id, self.app_id
+                    )));
+                }
+                return NetworkApp::from_credential(
+                    credential,
+                    Some(endpoint.clone()),
+                    self.capabilities.clone(),
+                )
+                .await;
+            }
+        }
+
         let mut request_token = [0u8; 32];
         OsRng.fill_bytes(&mut request_token);
         let pending = request_app_registration(
@@ -2822,9 +3173,11 @@ impl NetworkAppBuilder {
             }
             other => other,
         })?;
-        let save_path = self
-            .credential_path
-            .unwrap_or_else(|| preferred_credential_path(&self.app_id));
+        let save_path = self.credential_path.unwrap_or_else(|| {
+            profile_id
+                .map(|profile| preferred_profile_credential_path(&self.app_id, profile))
+                .unwrap_or_else(|| preferred_credential_path(&self.app_id))
+        });
         Err(ClientError::AuthorizationRequired(Box::new(
             AuthorizationRequest {
                 endpoint,
@@ -3008,10 +3361,12 @@ async fn get_app_registration_status(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct EndpointDiscoveryFile {
     protocol_version: u16,
     endpoint: String,
+    #[serde(default)]
+    profile_id: String,
 }
 
 fn validate_app_id(app_id: &str) -> Result<(), ClientError> {
@@ -3045,7 +3400,75 @@ fn safe_app_id(app_id: &str) -> String {
         .collect()
 }
 
-fn find_credential_path(app_id: &str) -> Option<PathBuf> {
+fn profile_credential_filename(app_id: &str) -> String {
+    format!("{}.json", safe_app_id(app_id))
+}
+
+fn preferred_profile_credential_path(app_id: &str, profile_id: &str) -> PathBuf {
+    let profile = safe_app_id(profile_id);
+    let filename = profile_credential_filename(app_id);
+    if let Some(directory) = std::env::var_os("DAEMON_NETWORK_CREDENTIAL_DIR") {
+        return PathBuf::from(directory).join(profile).join(filename);
+    }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data)
+            .join("DaemonNetwork")
+            .join("credentials")
+            .join(profile)
+            .join(filename);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".daemon_network")
+            .join("credentials")
+            .join(profile)
+            .join(filename);
+    }
+    PathBuf::from("app_credentials").join(profile).join(filename)
+}
+
+fn profile_credential_search_paths(app_id: &str, profile_id: &str) -> Vec<PathBuf> {
+    let profile = safe_app_id(profile_id);
+    let filename = profile_credential_filename(app_id);
+    let mut paths = Vec::new();
+    if let Some(directory) = std::env::var_os("DAEMON_NETWORK_CREDENTIAL_DIR") {
+        paths.push(PathBuf::from(directory).join(&profile).join(&filename));
+    }
+    paths.push(PathBuf::from("app_credentials").join(&profile).join(&filename));
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            paths.push(parent.join("app_credentials").join(&profile).join(&filename));
+        }
+    }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        paths.push(
+            PathBuf::from(local_app_data)
+                .join("DaemonNetwork")
+                .join("credentials")
+                .join(&profile)
+                .join(&filename),
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(
+            PathBuf::from(home)
+                .join(".daemon_network")
+                .join("credentials")
+                .join(&profile)
+                .join(&filename),
+        );
+    }
+    deduplicate_paths(paths)
+}
+
+fn find_profile_credential_path(app_id: &str, profile_id: &str) -> Option<PathBuf> {
+    profile_credential_search_paths(app_id, profile_id)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+// Legacy unscoped paths are retained only for migration/backward compatibility.
+fn find_legacy_credential_path(app_id: &str) -> Option<PathBuf> {
     credential_search_paths(app_id)
         .into_iter()
         .find(|path| path.is_file())
@@ -3098,10 +3521,23 @@ fn credential_search_paths(app_id: &str) -> Vec<PathBuf> {
     deduplicate_paths(paths)
 }
 
-fn discover_endpoint() -> Result<String, ClientError> {
+fn discover_endpoint_info() -> Result<EndpointDiscoveryFile, ClientError> {
+    // An explicit endpoint environment variable predates account-aware discovery. If a normal
+    // discovery file matches it, retain the profile id; otherwise return an unscoped endpoint.
     if let Ok(endpoint) = std::env::var("DAEMON_NETWORK_ENDPOINT") {
         if !endpoint.trim().is_empty() {
-            return Ok(endpoint);
+            for path in endpoint_discovery_paths() {
+                let Ok(bytes) = std::fs::read(&path) else { continue; };
+                let Ok(discovery) = serde_json::from_slice::<EndpointDiscoveryFile>(&bytes) else { continue; };
+                if discovery.protocol_version == PROTOCOL_VERSION && discovery.endpoint == endpoint {
+                    return Ok(discovery);
+                }
+            }
+            return Ok(EndpointDiscoveryFile {
+                protocol_version: PROTOCOL_VERSION,
+                endpoint,
+                profile_id: String::new(),
+            });
         }
     }
     for path in endpoint_discovery_paths() {
@@ -3112,11 +3548,12 @@ fn discover_endpoint() -> Result<String, ClientError> {
             continue;
         };
         if discovery.protocol_version == PROTOCOL_VERSION && !discovery.endpoint.trim().is_empty() {
-            return Ok(discovery.endpoint);
+            return Ok(discovery);
         }
     }
     Err(ClientError::DaemonEndpointNotFound)
 }
+
 
 fn endpoint_discovery_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("app_credentials").join("daemon_endpoint.json")];
@@ -3380,6 +3817,21 @@ enum ApiResult {
         record_key: String,
         values: Vec<AppStoreValue>,
     },
+    PrivateValueStored { value: PrivateValueDescriptor },
+    PrivateValueRead { value: PrivateValueDescriptor, value_base64: String },
+    PrivateValueMissing { key: String },
+    PrivateValues { values: Vec<PrivateValueDescriptor> },
+    PrivateValueDeleted { key: String, deleted: bool },
+    PrivateValueRenewed { value: PrivateValueDescriptor },
+    PrivateBlobStarted { blob: PrivateBlobDescriptor },
+    PrivateBlobAppended { blob: PrivateBlobDescriptor },
+    PrivateBlobFinished { blob: PrivateBlobDescriptor },
+    PrivateBlobAborted { blob_id: String, aborted: bool },
+    PrivateBlobs { blobs: Vec<PrivateBlobDescriptor> },
+    PrivateBlobDeleted { blob_id: String, deleted: bool },
+    PrivateBlobRangeRead { blob: PrivateBlobDescriptor, offset: u64, data_base64: String },
+    PrivateBlobRenewed { blob: PrivateBlobDescriptor },
+    PrivateStorageUsage { usage: PrivateStorageUsage },
     BlobUploadStarted { upload: BlobUploadStatus },
     BlobUploadAppended { upload: BlobUploadStatus },
     BlobUploadFinished { blob: BlobDescriptor },

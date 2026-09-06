@@ -1,4 +1,5 @@
 use futures::future::BoxFuture;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use veilid_core::*;
 use rand_core::RngCore;
@@ -52,6 +53,9 @@ const DIRECT_APPLICATION_TIME_WINDOW_SECS: u64 = 10 * 60;
 /// require a VeilKnit handshake session. Applications must confirm important
 /// claims through signed/application DHT state before trusting them.
 const GOSSIP_APPLICATION_PROTOCOL_VERSION: u16 = 1;
+// Version 2 is reserved for daemon-owned compact gossip. It base64-encodes the
+// binary payload instead of serializing Vec<u8> as a large JSON integer array.
+const GOSSIP_APPLICATION_COMPACT_PROTOCOL_VERSION: u16 = 2;
 const GOSSIP_APPLICATION_TIME_WINDOW_SECS: u64 = 10 * 60;
 const MAX_GOSSIP_MESSAGES_PER_SENDER_PER_MINUTE: usize = 120;
 const MAX_GOSSIP_MESSAGES_GLOBAL_PER_MINUTE: usize = 600;
@@ -370,6 +374,19 @@ struct GossipApplicationEnvelope {
     sender_dht: String,
     sent_at: u64,
     payload: Vec<u8>,
+}
+
+/// Compact daemon-to-daemon gossip envelope. Version 1 remains unchanged for
+/// application compatibility; version 2 is used by the daemon gossip engine so
+/// binary frames do not inflate into JSON arrays of decimal byte values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactGossipApplicationEnvelope {
+    gossip_protocol_version: u16,
+    application_id: String,
+    message_id: [u8; 16],
+    sender_dht: String,
+    sent_at: u64,
+    payload_base64: String,
 }
 
 #[derive(Debug, Clone)]
@@ -879,7 +896,31 @@ impl HandshakeManager {
 
                 // Gossip is intentionally recognized before the authenticated direct
                 // envelope. It is an application hint channel over a Veilid private
-                // route and does not create a VeilKnit handshake session.
+                // route and does not create a VeilKnit handshake session. Daemon-owned
+                // engine traffic uses compact v2; legacy/raw app gossip remains v1.
+                if let Ok(envelope) = serde_json::from_slice::<CompactGossipApplicationEnvelope>(&data) {
+                    if envelope.gossip_protocol_version == GOSSIP_APPLICATION_COMPACT_PROTOCOL_VERSION {
+                        match BASE64.decode(&envelope.payload_base64) {
+                            Ok(payload) if payload.len() <= MAX_DIRECT_APPLICATION_MESSAGE_BYTES / 2 => {
+                                let envelope = GossipApplicationEnvelope {
+                                    gossip_protocol_version: GOSSIP_APPLICATION_PROTOCOL_VERSION,
+                                    application_id: envelope.application_id,
+                                    message_id: envelope.message_id,
+                                    sender_dht: envelope.sender_dht,
+                                    sent_at: envelope.sent_at,
+                                    payload,
+                                };
+                                let mut handshake = message_manager.lock().await;
+                                if let Err(error) = handshake.process_gossip_application(envelope).await {
+                                    crate::teprintln!("[gossip] Rejecting compact daemon gossip: {error}");
+                                }
+                            }
+                            Ok(_) => crate::teprintln!("[gossip] Rejecting oversized compact daemon gossip"),
+                            Err(error) => crate::teprintln!("[gossip] Rejecting invalid compact gossip payload: {error}"),
+                        }
+                        return;
+                    }
+                }
                 if let Ok(envelope) = serde_json::from_slice::<GossipApplicationEnvelope>(&data) {
                     if envelope.gossip_protocol_version == GOSSIP_APPLICATION_PROTOCOL_VERSION {
                         let mut handshake = message_manager.lock().await;
@@ -1631,7 +1672,7 @@ impl HandshakeManager {
         if payload.len() > MAX_DIRECT_APPLICATION_MESSAGE_BYTES / 2 {
             return Err("Gossip application payload exceeds protocol limit".into());
         }
-        peer_dht.parse::<RecordKey>()?;
+        let _ = peer_dht.parse::<RecordKey>()?;
 
         let (veilid, dht_module, our_dht) = {
             let manager = manager.lock().await;
@@ -1657,6 +1698,54 @@ impl HandshakeManager {
         let bytes = serde_json::to_vec(&envelope)?;
         if bytes.len() > MAX_DIRECT_APPLICATION_MESSAGE_BYTES {
             return Err("Encoded gossip application message exceeds protocol limit".into());
+        }
+        let route = fetch_route_blob(&dht_module, &peer_dht).await?.blob;
+        send_raw_private_route_message(&veilid, &route, bytes).await?;
+        Ok(message_id)
+    }
+
+    /// Daemon-internal compact variant used by the managed gossip engine. Raw
+    /// application gossip deliberately keeps the original v1 JSON shape so old
+    /// applications/daemons are not silently broken by this optimization.
+    pub async fn send_compact_gossip_application_message_shared(
+        manager: Arc<Mutex<Self>>,
+        peer_dht: String,
+        application_id: String,
+        payload: Vec<u8>,
+    ) -> Result<[u8; 16], Box<dyn std::error::Error + Send + Sync>> {
+        let application_id = application_id.trim().to_ascii_lowercase();
+        if application_id.is_empty() || application_id.len() > 256 {
+            return Err("Application id length is invalid".into());
+        }
+        if payload.len() > MAX_DIRECT_APPLICATION_MESSAGE_BYTES / 2 {
+            return Err("Compact gossip application payload exceeds protocol limit".into());
+        }
+        let _ = peer_dht.parse::<RecordKey>()?;
+
+        let (veilid, dht_module, our_dht) = {
+            let manager = manager.lock().await;
+            if peer_dht == manager.our_dht {
+                return Err("Refusing to send gossip to our own DHT identity".into());
+            }
+            if manager.is_reputation_blocked(&peer_dht).await {
+                return Err(format!("Peer {peer_dht} is blocked by reputation policy").into());
+            }
+            (manager.veilid.clone(), manager.dht_module.clone(), manager.our_dht.clone())
+        };
+
+        let mut message_id = [0u8; 16];
+        OsRng.fill_bytes(&mut message_id);
+        let envelope = CompactGossipApplicationEnvelope {
+            gossip_protocol_version: GOSSIP_APPLICATION_COMPACT_PROTOCOL_VERSION,
+            application_id,
+            message_id,
+            sender_dht: our_dht,
+            sent_at: current_timestamp(),
+            payload_base64: BASE64.encode(payload),
+        };
+        let bytes = serde_json::to_vec(&envelope)?;
+        if bytes.len() > MAX_DIRECT_APPLICATION_MESSAGE_BYTES {
+            return Err("Encoded compact gossip application message exceeds protocol limit".into());
         }
         let route = fetch_route_blob(&dht_module, &peer_dht).await?.blob;
         send_raw_private_route_message(&veilid, &route, bytes).await?;
@@ -1723,7 +1812,7 @@ impl HandshakeManager {
         if envelope.payload.len() > MAX_DIRECT_APPLICATION_MESSAGE_BYTES / 2 {
             return Err("Gossip payload exceeds protocol limit".into());
         }
-        envelope.sender_dht.parse::<RecordKey>()?;
+        let _ = envelope.sender_dht.parse::<RecordKey>()?;
         if envelope.sender_dht == self.our_dht {
             return Ok(());
         }
@@ -1848,7 +1937,7 @@ impl HandshakeManager {
             )
             .into());
         }
-        envelope.sender_dht.parse::<RecordKey>()?;
+        let _ = envelope.sender_dht.parse::<RecordKey>()?;
         if envelope.sender_dht == self.our_dht {
             return Ok(());
         }

@@ -564,34 +564,150 @@ impl MailboxRuntime {
         &mut self,
         events: &broadcast::Sender<MailboxEvent>,
     ) -> Result<(), MailboxError> {
+        self.flush_pending_writes_inner(events, None).await
+    }
+
+    async fn flush_pending_writes_shutdown_traced(
+        &mut self,
+        events: &broadcast::Sender<MailboxEvent>,
+        context: &'static str,
+    ) -> Result<(), MailboxError> {
+        self.flush_pending_writes_inner(events, Some(context)).await
+    }
+
+    async fn flush_pending_writes_inner(
+        &mut self,
+        events: &broadcast::Sender<MailboxEvent>,
+        trace_context: Option<&'static str>,
+    ) -> Result<(), MailboxError> {
         let mut advertisement_changed = false;
+        let flush_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox flush[{context}]: START pending_total={} overflow_stores={} mailbox_pending={} outbox_pending={} response_pending={}",
+                self.pending_page_sets(),
+                self.overflow_stores.len(),
+                self.mailbox_store.as_ref().map_or(0, CowPagedStore::pending_changes),
+                self.outbox_store.as_ref().map_or(0, CowPagedStore::pending_changes),
+                self.response_store.pending_changes(),
+            );
+        }
 
         // Overflow records are the data side of the mailbox pointer. Commit
         // them first; the owning mailbox index/digest is published afterward.
         for store in self.overflow_stores.values_mut() {
-            store
-                .commit(
-                    &self.dht,
-                    &self.config,
-                    &mut self.persistent.pending_transactions,
-                    &self.auth,
-                    &self.session,
-                )
-                .await?;
+            let pending = store.pending_changes();
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: overflow store={} START pending_pages={}", store.name, pending);
+            }
+            let started = std::time::Instant::now();
+            if let Some(context) = trace_context {
+                store
+                    .commit_shutdown_traced(
+                        &self.dht,
+                        &self.config,
+                        &mut self.persistent.pending_transactions,
+                        &self.auth,
+                        &self.session,
+                        context,
+                    )
+                    .await?;
+            } else {
+                store
+                    .commit(
+                        &self.dht,
+                        &self.config,
+                        &mut self.persistent.pending_transactions,
+                        &self.auth,
+                        &self.session,
+                    )
+                    .await?;
+            }
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: overflow store={} END elapsed={}ms", store.name, started.elapsed().as_millis());
+            }
         }
         if let Some(store) = &mut self.mailbox_store {
-            advertisement_changed |= store
-                .commit(
-                    &self.dht,
-                    &self.config,
-                    &mut self.persistent.pending_transactions,
-                    &self.auth,
-                    &self.session,
-                )
-                .await?;
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: mailbox store START pending_pages={}", store.pending_changes());
+            }
+            let started = std::time::Instant::now();
+            let changed = if let Some(context) = trace_context {
+                store
+                    .commit_shutdown_traced(
+                        &self.dht,
+                        &self.config,
+                        &mut self.persistent.pending_transactions,
+                        &self.auth,
+                        &self.session,
+                        context,
+                    )
+                    .await?
+            } else {
+                store
+                    .commit(
+                        &self.dht,
+                        &self.config,
+                        &mut self.persistent.pending_transactions,
+                        &self.auth,
+                        &self.session,
+                    )
+                    .await?
+            };
+            advertisement_changed |= changed;
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: mailbox store END elapsed={}ms changed={}", started.elapsed().as_millis(), advertisement_changed);
+            }
         }
         if let Some(store) = &mut self.outbox_store {
-            advertisement_changed |= store
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: outbox store START pending_pages={}", store.pending_changes());
+            }
+            let started = std::time::Instant::now();
+            let changed = if let Some(context) = trace_context {
+                store
+                    .commit_shutdown_traced(
+                        &self.dht,
+                        &self.config,
+                        &mut self.persistent.pending_transactions,
+                        &self.auth,
+                        &self.session,
+                        context,
+                    )
+                    .await?
+            } else {
+                store
+                    .commit(
+                        &self.dht,
+                        &self.config,
+                        &mut self.persistent.pending_transactions,
+                        &self.auth,
+                        &self.session,
+                    )
+                    .await?
+            };
+            advertisement_changed |= changed;
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: outbox store END elapsed={}ms changed={}", started.elapsed().as_millis(), changed);
+            }
+        }
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox flush[{context}]: response store START pending_pages={}", self.response_store.pending_changes());
+        }
+        let response_started = std::time::Instant::now();
+        let response_changed = if let Some(context) = trace_context {
+            self.response_store
+                .commit_shutdown_traced(
+                    &self.dht,
+                    &self.config,
+                    &mut self.persistent.pending_transactions,
+                    &self.auth,
+                    &self.session,
+                    context,
+                )
+                .await?
+        } else {
+            self.response_store
                 .commit(
                     &self.dht,
                     &self.config,
@@ -599,24 +715,37 @@ impl MailboxRuntime {
                     &self.auth,
                     &self.session,
                 )
-                .await?;
+                .await?
+        };
+        advertisement_changed |= response_changed;
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox flush[{context}]: response store END elapsed={}ms changed={}", response_started.elapsed().as_millis(), response_changed);
         }
-        advertisement_changed |= self
-            .response_store
-            .commit(
-                &self.dht,
-                &self.config,
-                &mut self.persistent.pending_transactions,
-                &self.auth,
-                &self.session,
-            )
-            .await?;
 
         // Counters and DHT package metadata are persisted only after every
         // authoritative page/index generation above has committed.
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox flush[{context}]: encrypted local persistence START");
+        }
+        let persist_started = std::time::Instant::now();
         self.persist().await?;
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox flush[{context}]: encrypted local persistence END elapsed={}ms", persist_started.elapsed().as_millis());
+        }
         if advertisement_changed {
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: advertisement publish START");
+            }
+            let advertisement_started = std::time::Instant::now();
             self.publish_advertisement(Some(events)).await?;
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox flush[{context}]: advertisement publish END elapsed={}ms", advertisement_started.elapsed().as_millis());
+            }
+        } else if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox flush[{context}]: advertisement unchanged; publish skipped");
+        }
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox flush[{context}]: END total_elapsed={}ms", flush_started.elapsed().as_millis());
         }
         Ok(())
     }
@@ -655,12 +784,31 @@ impl MailboxRuntime {
         &self,
         main_dht: &RecordKey,
     ) -> Result<MailboxAdvertisement, MailboxError> {
+        let started = std::time::Instant::now();
+        crate::mailbox_walk_debug!(
+            "ADVERTISEMENT_READ START main_dht={} subkey={}",
+            main_dht,
+            MAILBOX_ADVERTISEMENT_LOCATION
+        );
         let bytes = self
             .dht
             .read_foreign_subkey(main_dht.clone(), MAILBOX_ADVERTISEMENT_LOCATION, true)
             .await?;
+        crate::mailbox_walk_debug!(
+            "ADVERTISEMENT_READ DHT_END main_dht={} elapsed={}ms bytes={}",
+            main_dht,
+            started.elapsed().as_millis(),
+            bytes.len()
+        );
         let advertisement: MailboxAdvertisement = deserialize(&bytes)?;
         validate_advertisement(&advertisement, &self.config)?;
+        crate::mailbox_walk_debug!(
+            "ADVERTISEMENT_READ END main_dht={} total_elapsed={}ms mail_send={} custodian_mailbox={}",
+            main_dht,
+            started.elapsed().as_millis(),
+            advertisement.mail_send_dht.is_some(),
+            advertisement.custodian_mailbox_dht.is_some()
+        );
         Ok(advertisement)
     }
 

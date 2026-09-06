@@ -18,6 +18,7 @@
 #include <thread>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ui_localization.h"
@@ -37,12 +38,16 @@ constexpr UINT WM_APP_LOG_LINE = WM_APP + 1;
 constexpr UINT WM_APP_BACKEND_EXIT = WM_APP + 2;
 constexpr UINT WM_APP_TRAY = WM_APP + 3;
 constexpr UINT_PTR ID_SUMMARY_TIMER = 9001;
+constexpr UINT_PTR ID_APP_REQUEST_TIMER = 9002;
 
 constexpr int ID_TAB = 100;
 constexpr int ID_USERNAME = 110;
 constexpr int ID_PASSWORD = 111;
 constexpr int ID_LOGIN = 112;
 constexpr int ID_SIGNUP = 113;
+constexpr int ID_CONFIRM_PASSWORD = 114;
+constexpr int ID_AUTH_BACK = 115;
+constexpr int ID_ADVANCED_VIEW = 116;
 constexpr int ID_MAIN_KEY = 120;
 constexpr int ID_COPY_KEY = 121;
 constexpr int ID_MINIMIZE_TO_TRAY = 122;
@@ -148,6 +153,8 @@ constexpr int ID_TRAY_CRAZY = 202;
 constexpr int ID_CLOSE_PROPER = 301;
 constexpr int ID_CLOSE_CRAZY = 302;
 constexpr int ID_CLOSE_TRAY = 303;
+constexpr int ID_AUTH_DIALOG_SIGNIN = 401;
+constexpr int ID_AUTH_DIALOG_SIGNUP = 402;
 
 constexpr COLORREF kColorWindow = RGB(19, 19, 21);
 constexpr COLORREF kColorPanel = RGB(28, 28, 31);
@@ -169,6 +176,7 @@ HINSTANCE gInstance{};
 HWND gMainWindow{};
 HWND gHeaderTitle{};
 HWND gStatusLabel{};
+HWND gAdvancedViewButton{};
 HWND gTab{};
 std::vector<Page> gPages;
 
@@ -176,6 +184,13 @@ HWND gUsernameLabel{};
 HWND gUsernameEdit{};
 HWND gPasswordLabel{};
 HWND gPasswordEdit{};
+HWND gConfirmPasswordLabel{};
+HWND gConfirmPasswordEdit{};
+HWND gAuthModeLabel{};
+HWND gAuthBackButton{};
+HWND gConnectProgress{};
+HWND gConnectProgressLabel{};
+HWND gConnectedHintLabel{};
 HWND gLoginButton{};
 HWND gSignupButton{};
 HWND gRestoreBackupButton{};
@@ -347,6 +362,11 @@ std::atomic<bool> gProcessRunning{false};
 std::atomic<bool> gAuthenticated{false};
 std::atomic<bool> gReady{false};
 std::atomic<bool> gClosingProperly{false};
+bool gSignupMode = false;
+bool gConnecting = false;
+bool gReadyMessageShown = false;
+bool gAdvancedUi = false;
+std::unordered_set<unsigned long long> gPromptedAppRequests;
 
 NOTIFYICONDATAW gTrayData{};
 bool gTrayAdded = false;
@@ -356,6 +376,9 @@ std::wstring gMainDhtKey;
 bool SendBackendLine(const std::wstring& line);
 bool CopyTextToClipboard(const std::wstring& value);
 void ShowSelectedPage();
+void UpdateOverviewMode();
+void ApplyAuthMode(bool signup);
+void RebuildTabsForMode();
 
 const wchar_t* T(const wchar_t* english) {
     return UiText(gLanguage, english);
@@ -409,9 +432,12 @@ void ApplyLanguage() {
     SetUiText(gHeaderTitle, L"VeilKnit Daemon");
     SetUiText(gUsernameLabel, L"Username");
     SetUiText(gPasswordLabel, L"Password");
-    SetUiText(gLanguageLabel, L"🌐 Language");
-    SetUiText(gLoginButton, L"Login");
+    SetUiText(gConfirmPasswordLabel, L"Confirm password");
+    SetUiText(gAuthBackButton, L"Back");
+    if (gAuthModeLabel) SetWindowTextW(gAuthModeLabel, gSignupMode ? T(L"Create account") : T(L"Sign in"));
+    if (gLoginButton) SetWindowTextW(gLoginButton, gSignupMode ? T(L"Create account") : T(L"Sign in"));
     SetUiText(gSignupButton, L"Sign up");
+    SetUiText(gLanguageLabel, L"🌐 Language");
     SetUiText(gRestoreBackupButton, L"Restore backup");
     SetUiText(gBackupPassphraseLabel, L"Backup passphrase");
     SetUiText(gBackupLocalButton, L"Create local backup");
@@ -520,14 +546,9 @@ void ApplyLanguage() {
     SetUiText(gProfileListButton, L"List profiles");
     SetUiText(gProfileUseButton, L"Use after restart");
     SetUiText(gProfileRetireButton, L"Retire profile");
+    if (gAdvancedViewButton) SetWindowTextW(gAdvancedViewButton, gAdvancedUi ? T(L"Simple") : T(L"Advanced"));
 
-    const wchar_t* tabs[] = {L"Applications", L"Backup", L"Overview", L"Handshake", L"Network", L"Headers", L"DHT", L"Mailbox", L"All logs"};
-    for (int index = 0; index < 9; ++index) {
-        TCITEMW item{};
-        item.mask = TCIF_TEXT;
-        item.pszText = const_cast<wchar_t*>(T(tabs[index]));
-        TabCtrl_SetItem(gTab, index, &item);
-    }
+    RebuildTabsForMode();
     RefreshWindowPaint();
 }
 
@@ -798,9 +819,54 @@ void AppendToLog(HWND log, const std::wstring& line) {
 void EnableCredentialControls(bool enabled) {
     EnableWindow(gUsernameEdit, enabled);
     EnableWindow(gPasswordEdit, enabled);
+    EnableWindow(gConfirmPasswordEdit, enabled);
     EnableWindow(gLoginButton, enabled);
-    EnableWindow(gSignupButton, enabled);
+    EnableWindow(gAuthBackButton, enabled);
     EnableWindow(gRestoreBackupButton, enabled);
+}
+
+void ApplyAuthMode(bool signup) {
+    gSignupMode = signup;
+    if (gAuthModeLabel) SetWindowTextW(gAuthModeLabel, signup ? T(L"Create account") : T(L"Sign in"));
+    if (gLoginButton) SetWindowTextW(gLoginButton, signup ? T(L"Create account") : T(L"Sign in"));
+    if (gConfirmPasswordEdit) SetWindowTextW(gConfirmPasswordEdit, L"");
+    UpdateOverviewMode();
+}
+
+void SetConnectionProgressStatus(const wchar_t* text) {
+    if (gConnectProgressLabel) SetWindowTextW(gConnectProgressLabel, text);
+}
+
+void UpdateOverviewMode() {
+    const bool auth = !gAuthenticated && !gConnecting && !gReady;
+    const bool connecting = gConnecting || (gAuthenticated && !gReady);
+    const bool ready = gReady;
+
+    const HWND authControls[] = {
+        gUsernameLabel, gUsernameEdit, gPasswordLabel, gPasswordEdit,
+        gAuthModeLabel, gLoginButton, gAuthBackButton
+    };
+    for (HWND control : authControls) if (control) ShowWindow(control, auth ? SW_SHOW : SW_HIDE);
+    if (gConfirmPasswordLabel) ShowWindow(gConfirmPasswordLabel, auth && gSignupMode ? SW_SHOW : SW_HIDE);
+    if (gConfirmPasswordEdit) ShowWindow(gConfirmPasswordEdit, auth && gSignupMode ? SW_SHOW : SW_HIDE);
+    if (gRestoreBackupButton) ShowWindow(gRestoreBackupButton, auth && !gSignupMode ? SW_SHOW : SW_HIDE);
+    if (gSignupButton) ShowWindow(gSignupButton, SW_HIDE);
+
+    if (gConnectProgress) {
+        ShowWindow(gConnectProgress, connecting ? SW_SHOW : SW_HIDE);
+        SendMessageW(gConnectProgress, PBM_SETMARQUEE, connecting ? TRUE : FALSE, 45);
+    }
+    if (gConnectProgressLabel) ShowWindow(gConnectProgressLabel, connecting ? SW_SHOW : SW_HIDE);
+    if (gConnectedHintLabel) ShowWindow(gConnectedHintLabel, ready ? SW_SHOW : SW_HIDE);
+
+    const HWND readyControls[] = {
+        gMainKeyLabel, gMainKeyEdit, gCopyKeyButton, gMinimizeCheckbox,
+        gRememberCloseCheckbox, gSaveLogButton, gShutdownButton
+    };
+    for (HWND control : readyControls) if (control) ShowWindow(control, ready ? SW_SHOW : SW_HIDE);
+    if (!gPages.empty() && gPages[0].log) ShowWindow(gPages[0].log, ready ? SW_SHOW : SW_HIDE);
+
+    EnableCredentialControls(auth);
 }
 
 void EnableBackupControls(bool enabled) {
@@ -899,6 +965,25 @@ void AppendPendingRequestMarker(const std::wstring& marker) {
     ListView_SetItemText(gAppRequestList, row, 1, name.data());
     std::wstring requestText = L"#" + std::to_wstring(requestId);
     ListView_SetItemText(gAppRequestList, row, 2, requestText.data());
+
+    // A newly installed app should not force the user to hunt through the daemon UI.
+    // Surface a one-time native approval prompt even when the main window is hidden in the tray.
+    if (gReady && gPromptedAppRequests.insert(requestId).second) {
+        const std::wstring shownName = name.empty() ? app : name;
+        const std::wstring message = shownName + L" wants permission to connect to your VeilKnit account.\n\n" +
+            app + L"\n\nYes = Allow   No = Refuse   Cancel = decide later in VeilKnit Daemon.";
+        const int answer = MessageBoxW(
+            nullptr, message.c_str(), L"VeilKnit application request",
+            MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
+        if (answer == IDYES) {
+            SendBackendLine(L"app-approve " + std::to_wstring(requestId));
+            SendBackendLine(L"app-pending");
+        } else if (answer == IDNO) {
+            SendBackendLine(
+                L"app-reject " + std::to_wstring(requestId) + L" rejected by the local user");
+            SendBackendLine(L"app-pending");
+        }
+    }
 }
 
 void AppendFoundAppMarker(const std::wstring& marker) {
@@ -947,6 +1032,24 @@ void ProcessLogLine(const std::wstring& line) {
     }
 
     const std::wstring lower = ToLower(line);
+    if (!gReady) {
+        if (lower.find(L"attaching to network") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Attaching to Veilid: Attaching...");
+        else if (lower.find(L"attachedfull") != std::wstring::npos || lower.find(L"public_ready=true") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Attaching to Veilid: Connected");
+        else if (lower.find(L"restoring") != std::wstring::npos || lower.find(L"saved dht") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Restoring saved network data...");
+        else if (lower.find(L"main dht") != std::wstring::npos && (lower.find(L"creating") != std::wstring::npos || lower.find(L"setup") != std::wstring::npos))
+            SetConnectionProgressStatus(L"Creating main DHT...");
+        else if (lower.find(L"main dht is ready") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Main DHT ready...");
+        else if (lower.find(L"mailbox controller started") != std::wstring::npos || lower.find(L"starting mailbox") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Creating mailbox...");
+        else if (lower.find(L"app directory ready") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Preparing application services...");
+        else if (lower.find(L"local application api") != std::wstring::npos)
+            SetConnectionProgressStatus(L"Starting application connection service...");
+    }
     if (line.find(L"GUI_APP_REQUESTS_BEGIN") != std::wstring::npos) {
         if (gAppRequestList) ListView_DeleteAllItems(gAppRequestList);
         return;
@@ -1043,35 +1146,53 @@ void ProcessLogLine(const std::wstring& line) {
 
     if (lower.find(L"welcome,") != std::wstring::npos) {
         gAuthenticated = true;
+        gConnecting = true;
         TabCtrl_SetCurSel(gTab, 0);
         ShowSelectedPage();
         SetConnectionStatus(T(L"Authenticated; starting network services..."), kColorWarning);
+        SetConnectionProgressStatus(L"Starting network services...");
         SetWindowTextW(gPasswordEdit, L"");
+        SetWindowTextW(gConfirmPasswordEdit, L"");
+        UpdateOverviewMode();
     }
 
     if (line.find(L"[gui] READY") != std::wstring::npos) {
         gReady = true;
-        EnableCredentialControls(false);
+        gConnecting = false;
+        gAdvancedUi = false;
         EnableBackupControls(true);
         SetConnectionStatus(T(L"Running"), kColorSuccess);
+        RebuildTabsForMode();
+        UpdateOverviewMode();
+        TabCtrl_SetCurSel(gTab, 0);
+        ShowSelectedPage();
         SendBackendLine(L"walk-settings");
         SendBackendLine(L"headers");
         SendBackendLine(L"summary");
         SendBackendLine(L"app-pending");
+        if (!gReadyMessageShown) {
+            gReadyMessageShown = true;
+            MessageBoxW(
+                gMainWindow,
+                L"You're now connected. You can close this window and VeilKnit will remain in the tray area, ready for your VeilKnit apps.",
+                L"VeilKnit is ready", MB_OK | MB_ICONINFORMATION);
+        }
     }
 
     if (ContainsAny(lower, {L"no account with that username", L"wrong password",
                             L"username is already taken", L"usernames may only contain"})) {
         gAuthenticated = false;
-        TabCtrl_SetCurSel(gTab, 2);
+        gConnecting = false;
+        TabCtrl_SetCurSel(gTab, 0);
         ShowSelectedPage();
-        EnableCredentialControls(true);
+        UpdateOverviewMode();
         SetConnectionStatus(T(L"Authentication failed; correct the details and try again."), kColorRed);
         SetFocus(gPasswordEdit);
     }
     if (ContainsAny(lower, {L"restored account", L"could not restore backup"})) {
         gAuthenticated = false;
-        EnableCredentialControls(true);
+        gConnecting = false;
+        UpdateOverviewMode();
         SetConnectionStatus(
             lower.find(L"restored account") != std::wstring::npos
                 ? T(L"Backup restored; log in with the account's original password.")
@@ -1090,10 +1211,10 @@ std::filesystem::path ExecutableDirectory() {
 std::filesystem::path FindBackendExecutable() {
     const auto directory = ExecutableDirectory();
     const std::vector<std::filesystem::path> candidates = {
-        directory / L"veilid_test_node.exe",
-        directory / L"backend" / L"veilid_test_node.exe",
-        directory.parent_path().parent_path().parent_path() / L"target" / L"release" / L"veilid_test_node.exe",
-        directory.parent_path().parent_path().parent_path() / L"target" / L"debug" / L"veilid_test_node.exe",
+        directory / L"VeilKnitNode.exe",
+        directory / L"backend" / L"VeilKnitNode.exe",
+        directory.parent_path().parent_path().parent_path() / L"target" / L"release" / L"VeilKnitNode.exe",
+        directory.parent_path().parent_path().parent_path() / L"target" / L"debug" / L"VeilKnitNode.exe",
     };
     for (const auto& candidate : candidates) {
         std::error_code error;
@@ -1282,7 +1403,7 @@ bool StartBackendProcess() {
     const std::filesystem::path backend = FindBackendExecutable();
     if (backend.empty()) {
         MessageBoxW(gMainWindow,
-                    L"veilid_test_node.exe was not found. Build the Rust backend first, then place it beside VeilKnitGui.exe.",
+                    L"VeilKnitNode.exe was not found. Build the Rust backend first, then place it beside VeilKnitDaemon.exe.",
                     kWindowTitle, MB_OK | MB_ICONERROR);
         return false;
     }
@@ -1346,6 +1467,9 @@ bool StartBackendProcess() {
     gAuthenticated = false;
     gReady = false;
     gClosingProperly = false;
+    // Request ids are scoped to a daemon/account run. A different account may legitimately
+    // reuse a numeric id, so never carry the one-time popup suppression across sessions.
+    gPromptedAppRequests.clear();
 
     gReaderThread = std::thread(ReaderLoop);
     SetStatus(T(L"Backend started; authenticating..."));
@@ -1526,8 +1650,12 @@ void HandleBackupAction(int id) {
 }
 
 void SubmitCredentials(bool signup) {
+    // The primary authentication button is mode-aware. Keep the bool argument for compatibility
+    // with older command routing, but the selected screen is authoritative.
+    signup = gSignupMode;
     const std::wstring username = WindowText(gUsernameEdit);
     const std::wstring password = WindowText(gPasswordEdit);
+    const std::wstring confirmation = WindowText(gConfirmPasswordEdit);
 
     if (!ValidUsername(username)) {
         MessageBoxW(gMainWindow,
@@ -1542,19 +1670,30 @@ void SubmitCredentials(bool signup) {
         SetFocus(gPasswordEdit);
         return;
     }
+    if (signup && password != confirmation) {
+        MessageBoxW(gMainWindow, T(L"The two passwords do not match."),
+                    T(L"VeilKnit Daemon"), MB_OK | MB_ICONWARNING);
+        SetFocus(gConfirmPasswordEdit);
+        return;
+    }
 
     if (!StartBackendProcess()) {
         return;
     }
 
+    gConnecting = true;
     EnableCredentialControls(false);
     SetStatus(signup ? L"Creating account..." : L"Logging in...");
+    SetConnectionProgressStatus(signup ? L"Creating your VeilKnit account..." : L"Signing in...");
+    UpdateOverviewMode();
     const std::wstring payload = (signup ? L"s\n" : L"l\n") + username + L"\n" + password + L"\n";
     if (!WriteBackendBytes(WideToUtf8(payload))) {
-        EnableCredentialControls(true);
+        gConnecting = false;
+        UpdateOverviewMode();
         SetStatus(L"Could not send credentials to the backend.");
     }
     SetWindowTextW(gPasswordEdit, L"");
+    SetWindowTextW(gConfirmPasswordEdit, L"");
 }
 
 void StartHandshake(bool statusOnly) {
@@ -2059,9 +2198,17 @@ void MinimizeWindowToTray() {
 }
 
 void PromptForClose() {
+    if (!gProcessRunning && !gAuthenticated && !gConnecting) {
+        ForceClose();
+        return;
+    }
     if (gSavedCloseAction == 1) { BeginProperShutdown(); return; }
     if (gSavedCloseAction == 2) { ForceClose(); return; }
     if (gSavedCloseAction == 3) { MinimizeWindowToTray(); return; }
+
+    // Consumer default: once connected, X means "hide this window" rather than "kill my node".
+    // Proper shutdown remains available from the power button / tray menu.
+    if (gReady) { MinimizeWindowToTray(); return; }
 
     TASKDIALOG_BUTTON buttons[] = {
         {ID_CLOSE_PROPER, L"Close properly\nSave DHT state and stop network services cleanly."},
@@ -2106,7 +2253,8 @@ void PromptForClose() {
 void LayoutPages(int clientWidth, int clientHeight) {
     constexpr int headerHeight = 54;
     MoveWindow(gHeaderTitle, 16, 8, clientWidth / 2, 28, TRUE);
-    MoveWindow(gStatusLabel, clientWidth / 2, 14, clientWidth / 2 - 18, 22, TRUE);
+    MoveWindow(gAdvancedViewButton, clientWidth - 108, 10, 92, 30, TRUE);
+    MoveWindow(gStatusLabel, clientWidth / 2, 14, std::max(100, clientWidth / 2 - 126), 22, TRUE);
     MoveWindow(gTab, 8, headerHeight, clientWidth - 16, clientHeight - headerHeight - 8, TRUE);
 
     RECT pageRect{};
@@ -2126,28 +2274,36 @@ void LayoutPages(int clientWidth, int clientHeight) {
     const int buttonWidth = 112;
     const int rowHeight = 28;
 
-    MoveWindow(gUsernameLabel, padding, 17, 76, 22, TRUE);
-    MoveWindow(gUsernameEdit, 86, 12, 180, rowHeight, TRUE);
-    MoveWindow(gLoginButton, 280, 11, 82, 30, TRUE);
-    MoveWindow(gSignupButton, 370, 11, 86, 30, TRUE);
-    MoveWindow(gRestoreBackupButton, 464, 11, 120, 30, TRUE);
-    MoveWindow(gHelpButton, 592, 11, 72, 30, TRUE);
-    MoveWindow(gPasswordLabel, padding, 53, 74, 22, TRUE);
-    MoveWindow(gPasswordEdit, 86, 48, 180, rowHeight, TRUE);
-    MoveWindow(gLanguageLabel, 280, 53, 98, 22, TRUE);
-    MoveWindow(gLanguageCombo, 382, 48, 164, 180, TRUE);
-    MoveWindow(gDiscordButton, 552, 48, 88, 30, TRUE);
+    MoveWindow(gAuthModeLabel, padding, 10, 240, 30, TRUE);
+    MoveWindow(gUsernameLabel, padding, 54, 76, 22, TRUE);
+    MoveWindow(gUsernameEdit, 104, 49, 220, rowHeight, TRUE);
+    MoveWindow(gPasswordLabel, padding, 90, 74, 22, TRUE);
+    MoveWindow(gPasswordEdit, 104, 85, 220, rowHeight, TRUE);
+    MoveWindow(gConfirmPasswordLabel, padding, 126, 92, 22, TRUE);
+    MoveWindow(gConfirmPasswordEdit, 104, 121, 220, rowHeight, TRUE);
+    MoveWindow(gLoginButton, 340, 49, 150, 30, TRUE);
+    MoveWindow(gRestoreBackupButton, 340, 85, 150, 30, TRUE);
+    MoveWindow(gAuthBackButton, 340, 121, 150, 30, TRUE);
+    MoveWindow(gSignupButton, 0, 0, 1, 1, TRUE);
+    MoveWindow(gHelpButton, pageWidth - 88, 10, 74, 30, TRUE);
+    MoveWindow(gLanguageLabel, std::max(500, pageWidth - 300), 54, 72, 22, TRUE);
+    MoveWindow(gLanguageCombo, std::max(570, pageWidth - 224), 49, 150, 180, TRUE);
+    MoveWindow(gDiscordButton, pageWidth - 102, 85, 88, 30, TRUE);
 
-    MoveWindow(gMainKeyLabel, padding, 89, 112, 22, TRUE);
-    MoveWindow(gMainKeyEdit, 126, 84, std::max(120, pageWidth - 126 - buttonWidth - 28), rowHeight, TRUE);
-    MoveWindow(gCopyKeyButton, pageWidth - buttonWidth - padding, 83, buttonWidth, 30, TRUE);
+    MoveWindow(gConnectProgress, padding, 72, std::max(220, pageWidth - padding * 2), 18, TRUE);
+    MoveWindow(gConnectProgressLabel, padding, 100, pageWidth - padding * 2, 28, TRUE);
+    MoveWindow(gConnectedHintLabel, padding, 10, std::max(220, pageWidth - 220), 42, TRUE);
 
-    MoveWindow(gMinimizeCheckbox, padding, 125, 238, 24, TRUE);
-    MoveWindow(gRememberCloseCheckbox, padding, 151, 260, 24, TRUE);
-    MoveWindow(gSaveLogButton, 280, 146, 118, 30, TRUE);
-    MoveWindow(gShutdownButton, 408, 146, 146, 30, TRUE);
-    MoveWindow(gPages[0].log, padding, 184, pageWidth - padding * 2,
-               std::max(40, pageHeight - 198), TRUE);
+    MoveWindow(gMainKeyLabel, padding, 92, 112, 22, TRUE);
+    MoveWindow(gMainKeyEdit, 126, 87, std::max(120, pageWidth - 126 - buttonWidth - 28), rowHeight, TRUE);
+    MoveWindow(gCopyKeyButton, pageWidth - buttonWidth - padding, 86, buttonWidth, 30, TRUE);
+
+    MoveWindow(gMinimizeCheckbox, padding, 128, 238, 24, TRUE);
+    MoveWindow(gRememberCloseCheckbox, padding, 154, 260, 24, TRUE);
+    MoveWindow(gSaveLogButton, 280, 149, 118, 30, TRUE);
+    MoveWindow(gShutdownButton, 408, 149, 146, 30, TRUE);
+    MoveWindow(gPages[0].log, padding, 187, pageWidth - padding * 2,
+               std::max(40, pageHeight - 201), TRUE);
 
     MoveWindow(gHandshakeLabel, padding, 18, 132, 22, TRUE);
     MoveWindow(gHandshakeEdit, 146, 13, std::max(120, pageWidth - 146 - 306), rowHeight, TRUE);
@@ -2397,10 +2553,56 @@ void LayoutPages(int clientWidth, int clientHeight) {
                pageHeight - padding * 2, TRUE);
 }
 
-void ShowSelectedPage() {
-    static constexpr int kTabPageMap[] = {6, 8, 0, 1, 2, 3, 4, 5, 7};
+void RebuildTabsForMode() {
+    if (!gTab) return;
     const int selected = TabCtrl_GetCurSel(gTab);
-    const int selectedPage = (selected >= 0 && selected < 9) ? kTabPageMap[selected] : 0;
+    TabCtrl_DeleteAllItems(gTab);
+
+    const wchar_t* labels[9]{};
+    int count = 0;
+    if (!gReady) {
+        labels[0] = L"Welcome";
+        count = 1;
+    } else if (!gAdvancedUi) {
+        labels[0] = L"Applications";
+        labels[1] = L"Backup";
+        labels[2] = L"Overview";
+        count = 3;
+    } else {
+        const wchar_t* full[] = {
+            L"Applications", L"Backup", L"Overview", L"Handshake", L"Network",
+            L"Headers", L"DHT", L"Mailbox", L"All logs"
+        };
+        for (int index = 0; index < 9; ++index) labels[index] = full[index];
+        count = 9;
+    }
+
+    for (int index = 0; index < count; ++index) {
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = const_cast<wchar_t*>(T(labels[index]));
+        TabCtrl_InsertItem(gTab, index, &item);
+    }
+    TabCtrl_SetCurSel(gTab, (selected >= 0 && selected < count) ? selected : 0);
+    if (gAdvancedViewButton) {
+        ShowWindow(gAdvancedViewButton, gReady ? SW_SHOW : SW_HIDE);
+        SetWindowTextW(gAdvancedViewButton, gAdvancedUi ? T(L"Simple") : T(L"Advanced"));
+    }
+    ShowSelectedPage();
+}
+
+void ShowSelectedPage() {
+    static constexpr int kFullMap[] = {6, 8, 0, 1, 2, 3, 4, 5, 7};
+    static constexpr int kSimpleMap[] = {6, 8, 0};
+    const int selected = TabCtrl_GetCurSel(gTab);
+    int selectedPage = 0;
+    if (!gReady) {
+        selectedPage = 0;
+    } else if (!gAdvancedUi) {
+        selectedPage = (selected >= 0 && selected < 3) ? kSimpleMap[selected] : 6;
+    } else {
+        selectedPage = (selected >= 0 && selected < 9) ? kFullMap[selected] : 6;
+    }
     for (size_t index = 0; index < gPages.size(); ++index) {
         ShowWindow(gPages[index].container, static_cast<int>(index) == selectedPage ? SW_SHOW : SW_HIDE);
     }
@@ -2475,6 +2677,8 @@ void CreateInterface(HWND window) {
     gHeaderTitle = CreateLabel(window, L"VEILKNIT DAEMON");
     ApplyFont(gHeaderTitle, gTitleFont);
     gStatusLabel = CreateLabel(window, L"Not connected");
+    gAdvancedViewButton = CreateButton(window, L"Advanced", ID_ADVANCED_VIEW);
+    ShowWindow(gAdvancedViewButton, SW_HIDE);
 
     gTab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
@@ -2504,12 +2708,24 @@ void CreateInterface(HWND window) {
     HWND overview = gPages[0].container;
     gUsernameLabel = CreateLabel(overview, L"Username");
     gUsernameEdit = CreateEdit(overview, ID_USERNAME);
+    gAuthModeLabel = CreateLabel(overview, L"Sign in");
+    ApplyFont(gAuthModeLabel, gTitleFont);
     gPasswordLabel = CreateLabel(overview, L"Password");
     gPasswordEdit = CreateEdit(overview, ID_PASSWORD, ES_PASSWORD);
     SendMessageW(gPasswordEdit, EM_SETPASSWORDCHAR, 0x25CF, 0);
-    gLoginButton = CreateButton(overview, L"Login", ID_LOGIN);
+    gConfirmPasswordLabel = CreateLabel(overview, L"Confirm password");
+    gConfirmPasswordEdit = CreateEdit(overview, ID_CONFIRM_PASSWORD, ES_PASSWORD);
+    SendMessageW(gConfirmPasswordEdit, EM_SETPASSWORDCHAR, 0x25CF, 0);
+    gLoginButton = CreateButton(overview, L"Sign in", ID_LOGIN);
     gSignupButton = CreateButton(overview, L"Sign up", ID_SIGNUP);
+    gAuthBackButton = CreateButton(overview, L"Back", ID_AUTH_BACK);
     gRestoreBackupButton = CreateButton(overview, L"Restore backup", ID_RESTORE_BACKUP);
+    gConnectProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+        WS_CHILD | PBS_MARQUEE, 0, 0, 10, 10, overview, nullptr, gInstance, nullptr);
+    SetWindowTheme(gConnectProgress, L"Explorer", nullptr);
+    gConnectProgressLabel = CreateLabel(overview, L"Preparing VeilKnit...");
+    gConnectedHintLabel = CreateLabel(overview,
+        L"Connected. You can close this window; VeilKnit will stay in the tray and remain ready for your apps.");
     gMainKeyLabel = CreateLabel(overview, L"Main DHT key");
     gMainKeyEdit = CreateEdit(overview, ID_MAIN_KEY, ES_READONLY);
     gCopyKeyButton = CreateButton(overview, L"Copy key", ID_COPY_KEY);
@@ -2559,6 +2775,7 @@ void CreateInterface(HWND window) {
     gBackupStatusButton = CreateButton(backup, L"Recovery status", ID_BACKUP_STATUS);
     gBackupWipeButton = CreateButton(backup, L"Wipe network recovery", ID_BACKUP_WIPE);
     EnableBackupControls(false);
+    UpdateOverviewMode();
 
     gOldUsernameProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gUsernameEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CredentialEditProc)));
     gOldPasswordProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gPasswordEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CredentialEditProc)));
@@ -2755,9 +2972,11 @@ void CreateInterface(HWND window) {
     gProfileUseButton = CreateButton(applications, L"Use after restart", ID_PROFILE_USE);
     gProfileRetireButton = CreateButton(applications, L"Retire profile", ID_PROFILE_RETIRE);
 
-    // Keep the login form visible until authentication succeeds. Once the
-    // account is authenticated, ProcessLogLine switches to Applications (tab 0).
-    TabCtrl_SetCurSel(gTab, 2);
+    // Before authentication, present a single consumer-facing Welcome tab. Once READY arrives,
+    // the simplified Applications/Backup/Overview set becomes the default; Advanced restores all
+    // technical tabs without removing any of the original controls.
+    RebuildTabsForMode();
+    TabCtrl_SetCurSel(gTab, 0);
     ShowSelectedPage();
     ApplyLanguage();
 }
@@ -2891,8 +3110,38 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
         switch (id) {
-        case ID_LOGIN: SubmitCredentials(false); return 0;
-        case ID_SIGNUP: SubmitCredentials(true); return 0;
+        case ID_LOGIN: SubmitCredentials(gSignupMode); return 0;
+        case ID_SIGNUP: ApplyAuthMode(true); return 0;
+        case ID_ADVANCED_VIEW:
+            if (gReady) {
+                gAdvancedUi = !gAdvancedUi;
+                // Always land on Applications when changing modes. RebuildTabsForMode also
+                // refreshes the translated tab labels and the Advanced/Simple button text.
+                TabCtrl_SetCurSel(gTab, 0);
+                RebuildTabsForMode();
+            }
+            return 0;
+        case ID_AUTH_BACK: {
+            TASKDIALOG_BUTTON buttons[] = {
+                {ID_AUTH_DIALOG_SIGNIN, L"Sign in"},
+                {ID_AUTH_DIALOG_SIGNUP, L"Create account"},
+            };
+            TASKDIALOGCONFIG config{};
+            config.cbSize = sizeof(config);
+            config.hwndParent = gMainWindow;
+            config.dwFlags = TDF_USE_COMMAND_LINKS | TDF_POSITION_RELATIVE_TO_WINDOW;
+            config.pszWindowTitle = kWindowTitle;
+            config.pszMainInstruction = L"Welcome to VeilKnit";
+            config.pszContent = L"Choose how you want to continue.";
+            config.pButtons = buttons;
+            config.cButtons = ARRAYSIZE(buttons);
+            config.nDefaultButton = ID_AUTH_DIALOG_SIGNIN;
+            int selected = ID_AUTH_DIALOG_SIGNIN;
+            if (SUCCEEDED(TaskDialogIndirect(&config, &selected, nullptr, nullptr))) {
+                ApplyAuthMode(selected == ID_AUTH_DIALOG_SIGNUP);
+            }
+            return 0;
+        }
         case ID_RESTORE_BACKUP: RestoreLocalBackup(); return 0;
         case ID_COPY_KEY: CopyMainKey(); return 0;
         case ID_SAVE_LOG: SaveSessionLog(); return 0;
@@ -2989,6 +3238,9 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     case WM_TIMER:
         if (wParam == ID_SUMMARY_TIMER && gReady) {
             SendBackendLine(L"summary");
+            return 0;
+        }
+        if (wParam == ID_APP_REQUEST_TIMER && gReady) {
             SendBackendLine(L"app-pending");
             return 0;
         }
@@ -3008,11 +3260,15 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             DestroyWindow(window);
         } else {
             SetStatus(L"Backend stopped (exit code " + std::to_wstring(exitCode) + L")");
-            EnableCredentialControls(true);
             EnableBackupControls(false);
             gAuthenticated = false;
             gReady = false;
-            TabCtrl_SetCurSel(gTab, 2);
+            gConnecting = false;
+            gReadyMessageShown = false;
+            gAdvancedUi = false;
+            RebuildTabsForMode();
+            UpdateOverviewMode();
+            TabCtrl_SetCurSel(gTab, 0);
             ShowSelectedPage();
         }
         return 0;
@@ -3029,6 +3285,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         return 0;
     case WM_DESTROY:
         KillTimer(window, ID_SUMMARY_TIMER);
+        KillTimer(window, ID_APP_REQUEST_TIMER);
         CleanupBackend();
         PostQuitMessage(0);
         return 0;
@@ -3046,7 +3303,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
 
     INITCOMMONCONTROLSEX controls{};
     controls.dwSize = sizeof(controls);
-    controls.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    controls.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&controls);
 
     gWindowBrush = CreateSolidBrush(kColorWindow);
@@ -3105,7 +3362,30 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     ShowWindow(gMainWindow, showCommand);
     UpdateWindow(gMainWindow);
     RefreshWindowPaint();
+
+    TASKDIALOG_BUTTON authButtons[] = {
+        {ID_AUTH_DIALOG_SIGNIN, L"Sign in\nUse an existing VeilKnit account or restore a backup."},
+        {ID_AUTH_DIALOG_SIGNUP, L"Create account\nSet up a new VeilKnit identity on this device."},
+    };
+    TASKDIALOGCONFIG authConfig{};
+    authConfig.cbSize = sizeof(authConfig);
+    authConfig.hwndParent = gMainWindow;
+    authConfig.dwFlags = TDF_USE_COMMAND_LINKS | TDF_POSITION_RELATIVE_TO_WINDOW;
+    authConfig.pszWindowTitle = kWindowTitle;
+    authConfig.pszMainInstruction = L"Welcome to VeilKnit";
+    authConfig.pszContent = L"Would you like to sign in or create a new account?";
+    authConfig.pButtons = authButtons;
+    authConfig.cButtons = ARRAYSIZE(authButtons);
+    authConfig.nDefaultButton = ID_AUTH_DIALOG_SIGNIN;
+    int authChoice = ID_AUTH_DIALOG_SIGNIN;
+    if (SUCCEEDED(TaskDialogIndirect(&authConfig, &authChoice, nullptr, nullptr))) {
+        ApplyAuthMode(authChoice == ID_AUTH_DIALOG_SIGNUP);
+    } else {
+        ApplyAuthMode(false);
+    }
+
     SetTimer(gMainWindow, ID_SUMMARY_TIMER, 15000, nullptr);
+    SetTimer(gMainWindow, ID_APP_REQUEST_TIMER, 3000, nullptr);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

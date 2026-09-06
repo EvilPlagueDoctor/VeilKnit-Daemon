@@ -716,6 +716,19 @@ impl MailboxRuntime {
         })
     }
 
+    fn pending_page_sets(&self) -> usize {
+        self.mailbox_store
+            .as_ref()
+            .map_or(0, CowPagedStore::pending_changes)
+            + self.outbox_store.as_ref().map_or(0, CowPagedStore::pending_changes)
+            + self.response_store.pending_changes()
+            + self
+                .overflow_stores
+                .values()
+                .map(CowPagedStore::pending_changes)
+                .sum::<usize>()
+    }
+
     async fn refresh_public_snapshot(
         &self,
         snapshot: &Arc<RwLock<MailboxPublicSnapshot>>,
@@ -936,8 +949,45 @@ impl MailboxRuntime {
     }
 }
 
+fn mailbox_command_name(command: &MailboxCommand) -> &'static str {
+    match command {
+        MailboxCommand::WalkNodeObserved(_) => "WalkNodeObserved",
+        MailboxCommand::WalkCompleted(_) => "WalkCompleted",
+        MailboxCommand::SubmitOutgoingMessage { .. } => "SubmitOutgoingMessage",
+        MailboxCommand::PublishServiceRequest { .. } => "PublishServiceRequest",
+        MailboxCommand::WithdrawServiceRequest { .. } => "WithdrawServiceRequest",
+        MailboxCommand::WithdrawOutgoingMessage { .. } => "WithdrawOutgoingMessage",
+        MailboxCommand::BumpOutgoingMessage { .. } => "BumpOutgoingMessage",
+        MailboxCommand::PublishResponse { .. } => "PublishResponse",
+        MailboxCommand::RotateReceiveKey { .. } => "RotateReceiveKey",
+        MailboxCommand::SetReceiveStatus { .. } => "SetReceiveStatus",
+        MailboxCommand::RetrieveOurMail => "RetrieveOurMail",
+        MailboxCommand::CheckPendingResponses => "CheckPendingResponses",
+        MailboxCommand::RunMaintenance => "RunMaintenance",
+        MailboxCommand::FlushPendingWrites { .. } => "FlushPendingWrites",
+        MailboxCommand::RepairMailbox { .. } => "RepairMailbox",
+        MailboxCommand::GetStatus { .. } => "GetStatus",
+        MailboxCommand::ListInbox { .. } => "ListInbox",
+        MailboxCommand::ReadInbox { .. } => "ReadInbox",
+        MailboxCommand::DeleteInbox { .. } => "DeleteInbox",
+        MailboxCommand::Shutdown { .. } => "Shutdown",
+    }
+}
+
+async fn wait_for_mailbox_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
+}
+
 async fn mailbox_actor(
     mut rx: mpsc::Receiver<MailboxCommand>,
+    shutdown_rx: watch::Receiver<bool>,
     mut runtime: MailboxRuntime,
     events: broadcast::Sender<MailboxEvent>,
     snapshot: Arc<RwLock<MailboxPublicSnapshot>>,
@@ -954,30 +1004,88 @@ async fn mailbox_actor(
     loop {
         tokio::select! {
             _ = batch_interval.tick() => {
-                if let Err(error) = runtime.flush_pending_writes(&events).await {
-                    let _ = events.send(MailboxEvent::Warning(format!("mailbox batch flush failed: {error}")));
-                }
-                if let Err(error) = runtime.refresh_public_snapshot(&snapshot).await {
-                    let _ = events.send(MailboxEvent::Warning(format!("mailbox snapshot refresh failed: {error}")));
+                let batch_started = std::time::Instant::now();
+                crate::shutdown_debug!("mailbox actor: BATCH TICK START pending={} queued_commands={}", runtime.pending_page_sets(), rx.len());
+                let mut stop = shutdown_rx.clone();
+                let interrupted = tokio::select! {
+                    biased;
+                    _ = wait_for_mailbox_shutdown_signal(&mut stop) => true,
+                    _ = async {
+                        if let Err(error) = runtime.flush_pending_writes(&events).await {
+                            let _ = events.send(MailboxEvent::Warning(format!("mailbox batch flush failed: {error}")));
+                        }
+                        if let Err(error) = runtime.refresh_public_snapshot(&snapshot).await {
+                            let _ = events.send(MailboxEvent::Warning(format!("mailbox snapshot refresh failed: {error}")));
+                        }
+                    } => false,
+                };
+                if interrupted {
+                    crate::shutdown_debug!("mailbox actor: BATCH TICK INTERRUPTED by shutdown after {}ms", batch_started.elapsed().as_millis());
+                } else {
+                    crate::shutdown_debug!("mailbox actor: BATCH TICK END elapsed={}ms pending={} queued_commands={}", batch_started.elapsed().as_millis(), runtime.pending_page_sets(), rx.len());
                 }
             }
             _ = maintenance_interval.tick() => {
-                if let Err(error) = runtime.run_maintenance(&events).await {
-                    let _ = events.send(MailboxEvent::Warning(format!("mailbox maintenance failed: {error}")));
-                }
-                if let Err(error) = runtime.refresh_public_snapshot(&snapshot).await {
-                    let _ = events.send(MailboxEvent::Warning(format!("mailbox snapshot refresh failed: {error}")));
+                let maintenance_started = std::time::Instant::now();
+                crate::shutdown_debug!("mailbox actor: MAINTENANCE START pending={} queued_commands={}", runtime.pending_page_sets(), rx.len());
+                let mut stop = shutdown_rx.clone();
+                let interrupted = tokio::select! {
+                    biased;
+                    _ = wait_for_mailbox_shutdown_signal(&mut stop) => true,
+                    _ = async {
+                        if let Err(error) = runtime.run_maintenance(&events).await {
+                            let _ = events.send(MailboxEvent::Warning(format!("mailbox maintenance failed: {error}")));
+                        }
+                        if let Err(error) = runtime.refresh_public_snapshot(&snapshot).await {
+                            let _ = events.send(MailboxEvent::Warning(format!("mailbox snapshot refresh failed: {error}")));
+                        }
+                    } => false,
+                };
+                if interrupted {
+                    crate::shutdown_debug!("mailbox actor: MAINTENANCE INTERRUPTED by shutdown after {}ms", maintenance_started.elapsed().as_millis());
+                } else {
+                    crate::shutdown_debug!("mailbox actor: MAINTENANCE END elapsed={}ms pending={} queued_commands={}", maintenance_started.elapsed().as_millis(), runtime.pending_page_sets(), rx.len());
                 }
             }
             command = rx.recv() => {
                 let Some(command) = command else {
-                    let _ = runtime.flush_pending_writes(&events).await;
+                    crate::shutdown_debug!("mailbox actor: command channel closed; final flush starting pending={}", runtime.pending_page_sets());
+                    let _ = runtime.flush_pending_writes_shutdown_traced(&events, "channel-close").await;
                     runtime.release_all_service_reply_routes();
+                    crate::shutdown_debug!("mailbox actor: command channel closed; actor exiting");
                     return;
                 };
+                let command_name = mailbox_command_name(&command);
+                let command_started = std::time::Instant::now();
+                crate::shutdown_debug!("mailbox actor: COMMAND START name={} queued_behind={} pending={}", command_name, rx.len(), runtime.pending_page_sets());
+
+                // Once shutdown has been requested, do not start stale queued
+                // work ahead of the Shutdown command.  Dropping a queued
+                // request also drops its reply sender, so any waiting caller
+                // receives ChannelClosed rather than hanging indefinitely.
+                if *shutdown_rx.borrow() && !matches!(&command, MailboxCommand::Shutdown { .. }) {
+                    crate::shutdown_debug!(
+                        "mailbox actor: COMMAND SKIPPED name={} because shutdown is pending",
+                        command_name
+                    );
+                    continue;
+                }
+
                 match command {
                     MailboxCommand::WalkNodeObserved(event) => {
-                        if let Err(error) = runtime.process_walk_observation(event, &events).await {
+                        let mut stop = shutdown_rx.clone();
+                        let result = tokio::select! {
+                            biased;
+                            _ = wait_for_mailbox_shutdown_signal(&mut stop) => {
+                                crate::shutdown_debug!(
+                                    "mailbox actor: WalkNodeObserved INTERRUPTED by shutdown after {}ms; dropping in-flight mailbox DHT work",
+                                    command_started.elapsed().as_millis()
+                                );
+                                None
+                            }
+                            result = runtime.process_walk_observation(event, &events) => Some(result),
+                        };
+                        if let Some(Err(error)) = result {
                             let _ = events.send(MailboxEvent::Warning(format!("walk mailbox observation failed: {error}")));
                         }
                     }
@@ -1056,11 +1164,45 @@ async fn mailbox_actor(
                         let _ = reply.send(runtime.delete_inbox_message(message_id).await);
                     }
                     MailboxCommand::Shutdown { reply } => {
-                        let result = runtime.flush_pending_writes(&events).await;
+                        crate::shutdown_debug!(
+                            "mailbox actor: SHUTDOWN received after queue drain; queued_remaining={} pending={} command_elapsed={}ms",
+                            rx.len(),
+                            runtime.pending_page_sets(),
+                            command_started.elapsed().as_millis()
+                        );
+                        let flush_started = std::time::Instant::now();
+                        let result = runtime
+                            .flush_pending_writes_shutdown_traced(&events, "shutdown")
+                            .await;
+                        crate::shutdown_debug!(
+                            "mailbox actor: shutdown flush returned after {}ms result={}",
+                            flush_started.elapsed().as_millis(),
+                            if result.is_ok() { "Ok" } else { "Err" }
+                        );
                         runtime.release_all_service_reply_routes();
+                        crate::shutdown_debug!("mailbox actor: service reply routes released; sending shutdown acknowledgement");
                         let _ = reply.send(result);
+                        crate::shutdown_debug!("mailbox actor: shutdown acknowledgement sent; actor exiting");
                         return;
                     }
+                }
+
+                crate::shutdown_debug!(
+                    "mailbox actor: COMMAND END name={} elapsed={}ms pending={} queued_commands={}",
+                    command_name,
+                    command_started.elapsed().as_millis(),
+                    runtime.pending_page_sets(),
+                    rx.len()
+                );
+
+                // Do not start the actor's normal post-command flush/snapshot
+                // work after shutdown has been signalled.  The queued Shutdown
+                // command owns the final traced flush and should run next.
+                if *shutdown_rx.borrow() {
+                    crate::shutdown_debug!(
+                        "mailbox actor: post-command maintenance skipped because shutdown is pending"
+                    );
+                    continue;
                 }
 
                 let pending = runtime.mailbox_store.as_ref().map_or(0, CowPagedStore::pending_changes)

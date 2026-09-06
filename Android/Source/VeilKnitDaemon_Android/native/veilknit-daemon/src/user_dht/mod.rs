@@ -21,7 +21,7 @@ use crate::{
     route_manager::RouteManager,
     types::{
         current_timestamp, decode_user_info, AppDirectoryInfo, AppInfo, UserInfo,
-        APPINFO_LOCATION, APP_DIRECTORY_LOCATION, APP_DIRECTORY_RECORD_VERSION,
+        APPINFO_LOCATION, APP_DIRECTORY_LOCATION, LEXICAL_LIBRARY_ADVERTISEMENT_LOCATION, APP_DIRECTORY_RECORD_VERSION,
         APP_INFO_RECORD_VERSION, STATUS_LOCATION,
     },
     user_auth::{AuthError, UserAuth, UserSession, UserSetupState},
@@ -49,8 +49,9 @@ pub const PRESENCE_HEARTBEAT_STOP_TIMEOUT_SECS: u64 = 3;
 
 /// Maximum time allowed for the final main-DHT offline publication.
 /// Veilid shutdown is not signaled until this write succeeds, fails, or reaches
-/// this explicit deadline.
-pub const PRESENCE_OFFLINE_WRITE_TIMEOUT_SECS: u64 = 20;
+/// this explicit deadline. Kept below lifecycle's six-second announce ceiling
+/// so the module can report its own timeout before the tier has to cancel it.
+pub const PRESENCE_OFFLINE_WRITE_TIMEOUT_SECS: u64 = 5;
 
 /// Encrypted user-store key containing all owned DHT descriptors/keypairs.
 pub const DHT_SNAPSHOT_KEY: &str = "dht_snapshot";
@@ -406,16 +407,23 @@ impl MainDhtRuntime {
         Ok(())
     }
 
+    /// Publish the compact lexical-library advertisement set at main-DHT subkey 12.
+    pub async fn publish_lexical_library_advertisements(&self, bytes: Vec<u8>) -> Result<(), UserDhtError> {
+        self.dht_module
+            .write_to_dht(self.package_index, LEXICAL_LIBRARY_ADVERTISEMENT_LOCATION, bytes)
+            .await?;
+        Ok(())
+    }
+
     pub async fn presence_snapshot(&self) -> UserInfo {
         self.presence.lock().await.clone()
     }
 
-    /// Stop heartbeats and publish a clean offline/logout record.
+    /// Stop the periodic presence heartbeat without doing network I/O.
     ///
-    /// Shutdown ordering is intentional: the heartbeat is stopped first, the
-    /// main DHT is then given one bounded offline-write attempt, and only after
-    /// this method returns may the supervisor signal Veilid shutdown.
-    pub async fn shutdown(&self) -> Result<(), UserDhtError> {
+    /// Lifecycle uses this as intake cleanup so no new heartbeat can race the final offline
+    /// announcement. It is safe to call even when the network is unreachable.
+    pub async fn stop_heartbeat(&self) -> Result<(), UserDhtError> {
         let _ = self.stop_tx.send(true);
 
         if let Some(mut task) = self.heartbeat_task.lock().await.take() {
@@ -439,10 +447,16 @@ impl MainDhtRuntime {
                 }
             }
         }
+        Ok(())
+    }
 
-        // Mark the in-memory record offline before beginning the network write.
-        // Even if the write fails or times out, the write was genuinely
-        // attempted while Veilid was still running and attached.
+    /// Publish one bounded clean offline/logout record while Veilid is still reachable.
+    ///
+    /// Lifecycle places this in the announce tier, so it can be skipped wholesale for an
+    /// unreachable host or a quick in-process restart without skipping local cleanup.
+    pub async fn publish_offline(&self) -> Result<(), UserDhtError> {
+        // Mark the in-memory record offline before beginning the network write. Even if the
+        // write fails or times out, the write was genuinely attempted while Veilid was alive.
         let snapshot = {
             let mut presence = self.presence.lock().await;
             presence.finish_session(current_timestamp());
@@ -462,6 +476,7 @@ impl MainDhtRuntime {
             ))),
         }
     }
+
 }
 
 async fn run_presence_heartbeat(

@@ -55,6 +55,11 @@ class VeilKnitApiService : Service() {
                 .put("ready", state.ready)
                 .put("authenticated", state.authenticated)
                 .put("status", state.status)
+                // Additive account/run metadata for client reconnection. profile_id is only
+                // exposed once the daemon is ready so a stale discovery file from the previous
+                // account cannot be observed during startup.
+                .put("profile_id", if (state.ready) DaemonApiRuntime.activeProfileId(filesDir) else "")
+                .put("daemon_instance_id", DaemonApiRuntime.daemonInstanceId())
                 .put("main_dht_key", state.mainDhtKey)
                 .put("last_error", state.lastError ?: JSONObject.NULL)
                 .toString()

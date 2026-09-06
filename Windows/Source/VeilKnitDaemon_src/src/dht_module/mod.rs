@@ -413,7 +413,6 @@ impl DHTModule {
                                     let options = SetDHTValueOptions {
                                         writer: Some(writer_keypair),
                                         allow_offline: None,
-                                        min_seqnum: None,
                                     };
 
                                     let data = normalize_write_bytes(data);
@@ -720,6 +719,8 @@ impl DHTModule {
                         } else {
                             None
                         };
+                        let record_key_text = record_key.to_string();
+                        let active_wait_started = std::time::Instant::now();
                         let Ok(active_permit) = Arc::clone(&active_operations)
                             .acquire_owned()
                             .await
@@ -727,34 +728,91 @@ impl DHTModule {
                             let _ = reply.send(Err(CreateDhtError::ChannelClosed));
                             continue;
                         };
+                        crate::mailbox_walk_debug!(
+                            "DHT single active-permit key={} subkey={} wait={}ms",
+                            record_key_text,
+                            location,
+                            active_wait_started.elapsed().as_millis()
+                        );
 
+                        let mut reply = reply;
                         tokio::spawn(async move {
                             let _active = active_permit;
                             if reply.is_closed() {
                                 return;
                             }
-                            let result = if let Some(package) = owned_package {
-                                read_owned_subkey_once(rc, package, location, force_refresh).await
-                            } else {
-                                async {
+
+                            let operation = async {
+                                let operation_started = std::time::Instant::now();
+                                if let Some(package) = owned_package {
+                                    crate::mailbox_walk_debug!(
+                                        "DHT single IO START key={} subkey={} owned=true",
+                                        record_key_text,
+                                        location
+                                    );
+                                    let result = read_owned_subkey_once(rc, package, location, force_refresh).await;
+                                    crate::mailbox_walk_debug!(
+                                        "DHT single IO END key={} subkey={} owned=true elapsed={}ms result={}",
+                                        record_key_text,
+                                        location,
+                                        operation_started.elapsed().as_millis(),
+                                        if result.is_ok() { "Ok" } else { "Err" }
+                                    );
+                                    result
+                                } else {
+                                    let foreign_wait = std::time::Instant::now();
                                     let _foreign = foreign_records
                                         .acquire_owned()
                                         .await
                                         .map_err(|_| CreateDhtError::ChannelClosed)?;
+                                    crate::mailbox_walk_debug!(
+                                        "DHT single foreign-open-permit key={} subkey={} wait={}ms",
+                                        record_key_text,
+                                        location,
+                                        foreign_wait.elapsed().as_millis()
+                                    );
+                                    let record_wait = std::time::Instant::now();
                                     let _record = record_lock
                                         .expect("foreign record lock must exist")
                                         .acquire_owned()
                                         .await
                                         .map_err(|_| CreateDhtError::ChannelClosed)?;
-                                    read_foreign_subkey_once(
+                                    crate::mailbox_walk_debug!(
+                                        "DHT single record-lock key={} subkey={} wait={}ms",
+                                        record_key_text,
+                                        location,
+                                        record_wait.elapsed().as_millis()
+                                    );
+                                    crate::mailbox_walk_debug!(
+                                        "DHT single IO START key={} subkey={} owned=false",
+                                        record_key_text,
+                                        location
+                                    );
+                                    let result = read_foreign_subkey_once(
                                         veilid,
-                                        record_key,
+                                        record_key.clone(),
                                         location,
                                         force_refresh,
                                     )
-                                    .await
+                                    .await;
+                                    crate::mailbox_walk_debug!(
+                                        "DHT single IO END key={} subkey={} owned=false elapsed={}ms result={}",
+                                        record_key_text,
+                                        location,
+                                        operation_started.elapsed().as_millis(),
+                                        if result.is_ok() { "Ok" } else { "Err" }
+                                    );
+                                    result
                                 }
-                                .await
+                            };
+                            tokio::pin!(operation);
+                            let result = tokio::select! {
+                                biased;
+                                _ = reply.closed() => {
+                                    crate::shutdown_debug!("dht foreign subkey read: caller dropped; cancelling in-flight operation");
+                                    return;
+                                }
+                                result = &mut operation => result,
                             };
 
                             let _ = reply.send(result);
@@ -798,12 +856,14 @@ impl DHTModule {
                             continue;
                         };
 
+                        let mut reply = reply;
                         tokio::spawn(async move {
                             let _active = active_permit;
                             if reply.is_closed() {
                                 return;
                             }
-                            let result = async {
+
+                            let operation = async {
                                 let _full_read = full_reads
                                     .acquire_owned()
                                     .await
@@ -827,8 +887,16 @@ impl DHTModule {
                                     )
                                     .await
                                 }
-                            }
-                            .await;
+                            };
+                            tokio::pin!(operation);
+                            let result = tokio::select! {
+                                biased;
+                                _ = reply.closed() => {
+                                    crate::shutdown_debug!("dht full foreign read: caller dropped; cancelling in-flight operation");
+                                    return;
+                                }
+                                result = &mut operation => result,
+                            };
 
                             let _ = reply.send(result);
                         });
@@ -864,6 +932,9 @@ impl DHTModule {
                         } else {
                             None
                         };
+                        let record_key_text = record_key.to_string();
+                        let location_count = locations.len();
+                        let active_wait_started = std::time::Instant::now();
                         let Ok(active_permit) = Arc::clone(&active_operations)
                             .acquire_owned()
                             .await
@@ -871,45 +942,109 @@ impl DHTModule {
                             let _ = reply.send(Err(CreateDhtError::ChannelClosed));
                             continue;
                         };
+                        crate::mailbox_walk_debug!(
+                            "DHT selected active-permit key={} subkeys={} wait={}ms",
+                            record_key_text,
+                            location_count,
+                            active_wait_started.elapsed().as_millis()
+                        );
 
+                        let mut reply = reply;
                         tokio::spawn(async move {
                             let _active = active_permit;
                             if reply.is_closed() {
                                 return;
                             }
-                            let result = async {
+
+                            let operation = async {
+                                let operation_started = std::time::Instant::now();
+                                let full_wait = std::time::Instant::now();
                                 let _full_read = full_reads
                                     .acquire_owned()
                                     .await
                                     .map_err(|_| CreateDhtError::ChannelClosed)?;
+                                crate::mailbox_walk_debug!(
+                                    "DHT selected full-read-permit key={} subkeys={} wait={}ms",
+                                    record_key_text,
+                                    location_count,
+                                    full_wait.elapsed().as_millis()
+                                );
                                 if let Some(package) = owned_package {
-                                    read_owned_subkeys_once(
+                                    crate::mailbox_walk_debug!(
+                                        "DHT selected IO START key={} subkeys={} owned=true",
+                                        record_key_text,
+                                        location_count
+                                    );
+                                    let result = read_owned_subkeys_once(
                                         rc,
                                         package,
                                         locations,
                                         force_refresh,
                                     )
-                                    .await
+                                    .await;
+                                    crate::mailbox_walk_debug!(
+                                        "DHT selected IO END key={} subkeys={} owned=true elapsed={}ms result={}",
+                                        record_key_text,
+                                        location_count,
+                                        operation_started.elapsed().as_millis(),
+                                        if result.is_ok() { "Ok" } else { "Err" }
+                                    );
+                                    result
                                 } else {
+                                    let foreign_wait = std::time::Instant::now();
                                     let _foreign = foreign_records
                                         .acquire_owned()
                                         .await
                                         .map_err(|_| CreateDhtError::ChannelClosed)?;
+                                    crate::mailbox_walk_debug!(
+                                        "DHT selected foreign-open-permit key={} subkeys={} wait={}ms",
+                                        record_key_text,
+                                        location_count,
+                                        foreign_wait.elapsed().as_millis()
+                                    );
+                                    let record_wait = std::time::Instant::now();
                                     let _record = record_lock
                                         .expect("foreign record lock must exist")
                                         .acquire_owned()
                                         .await
                                         .map_err(|_| CreateDhtError::ChannelClosed)?;
-                                    read_foreign_subkeys_once(
+                                    crate::mailbox_walk_debug!(
+                                        "DHT selected record-lock key={} subkeys={} wait={}ms",
+                                        record_key_text,
+                                        location_count,
+                                        record_wait.elapsed().as_millis()
+                                    );
+                                    crate::mailbox_walk_debug!(
+                                        "DHT selected IO START key={} subkeys={} owned=false",
+                                        record_key_text,
+                                        location_count
+                                    );
+                                    let result = read_foreign_subkeys_once(
                                         veilid,
-                                        record_key,
+                                        record_key.clone(),
                                         locations,
                                         force_refresh,
                                     )
-                                    .await
+                                    .await;
+                                    crate::mailbox_walk_debug!(
+                                        "DHT selected IO END key={} subkeys={} owned=false elapsed={}ms result={}",
+                                        record_key_text,
+                                        location_count,
+                                        operation_started.elapsed().as_millis(),
+                                        if result.is_ok() { "Ok" } else { "Err" }
+                                    );
+                                    result
                                 }
-                            }
-                            .await;
+                            };
+                            tokio::pin!(operation);
+                            let result = tokio::select! {
+                                biased;
+                                _ = reply.closed() => {
+                                    crate::shutdown_debug!("dht selected foreign read: caller dropped; cancelling in-flight operation");
+                                    return;
+                                }
+                                result = &mut operation => result,
+                            };
 
                             let _ = reply.send(result);
                         });
@@ -1631,16 +1766,37 @@ async fn read_foreign_subkey_once(
     location: u32,
     force_refresh: bool,
 ) -> Result<Vec<u8>, CreateDhtError> {
+    let total_started = std::time::Instant::now();
+    let key_text = record_key.to_string();
     let rc = veilid.routing_context().map_err(veilid_error)?;
 
-    timeout(
+    let open_started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE OPEN START key={} subkey={}",
+        key_text,
+        location
+    );
+    let _ = timeout(
         DHT_SINGLE_OPERATION_TIMEOUT,
         rc.open_dht_record(record_key.clone(), None),
     )
     .await
     .map_err(|_| CreateDhtError::OperationTimedOut("open foreign DHT".to_string()))?
     .map_err(veilid_error)?;
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE OPEN END key={} subkey={} elapsed={}ms",
+        key_text,
+        location,
+        open_started.elapsed().as_millis()
+    );
 
+    let read_started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE GET START key={} subkey={} force_refresh={}",
+        key_text,
+        location,
+        force_refresh
+    );
     let read_result = match timeout(
         DHT_SINGLE_OPERATION_TIMEOUT,
         rc.get_dht_value(record_key.clone(), location, force_refresh),
@@ -1659,8 +1815,34 @@ async fn read_foreign_subkey_once(
             "foreign DHT subkey read".to_string(),
         )),
     };
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE GET END key={} subkey={} elapsed={}ms result={}",
+        key_text,
+        location,
+        read_started.elapsed().as_millis(),
+        if read_result.is_ok() { "Ok" } else { "Err" }
+    );
 
+    let close_started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE CLOSE START key={} subkey={}",
+        key_text,
+        location
+    );
     let close_result = close_foreign_record(&rc, record_key).await;
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE CLOSE END key={} subkey={} elapsed={}ms result={}",
+        key_text,
+        location,
+        close_started.elapsed().as_millis(),
+        if close_result.is_ok() { "Ok" } else { "Err" }
+    );
+    crate::mailbox_walk_debug!(
+        "DHT single PHASE TOTAL key={} subkey={} elapsed={}ms",
+        key_text,
+        location,
+        total_started.elapsed().as_millis()
+    );
 
     match (read_result, close_result) {
         (Err(read_error), _) => Err(read_error),
@@ -1733,10 +1915,20 @@ async fn read_foreign_subkeys_once(
     mut locations: Vec<u32>,
     force_refresh: bool,
 ) -> Result<Vec<(u32, Result<Vec<u8>, CreateDhtError>)>, CreateDhtError> {
+    let total_started = std::time::Instant::now();
     locations.sort_unstable();
     locations.dedup();
+    let location_count = locations.len();
+    let key_text = record_key.to_string();
 
     let rc = veilid.routing_context().map_err(veilid_error)?;
+    let open_started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE OPEN START key={} subkeys={} locations={:?}",
+        key_text,
+        location_count,
+        locations
+    );
     let descriptor = timeout(
         DHT_SINGLE_OPERATION_TIMEOUT,
         rc.open_dht_record(record_key.clone(), None),
@@ -1744,13 +1936,34 @@ async fn read_foreign_subkeys_once(
     .await
     .map_err(|_| CreateDhtError::OperationTimedOut("open foreign DHT".to_string()))?
     .map_err(veilid_error)?;
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE OPEN END key={} subkeys={} elapsed={}ms",
+        key_text,
+        location_count,
+        open_started.elapsed().as_millis()
+    );
     let subkey_count = descriptor.ref_schema().subkey_count() as u32;
 
+    let batch_started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE GET_BATCH START key={} requested={} schema_subkeys={} concurrency={}",
+        key_text,
+        location_count,
+        subkey_count,
+        DHT_READ_CONCURRENCY
+    );
     let reads = stream::iter(locations)
         .map(|location| {
             let rc = rc.clone();
             let record_key = record_key.clone();
+            let key_text = key_text.clone();
             async move {
+                let one_started = std::time::Instant::now();
+                crate::mailbox_walk_debug!(
+                    "DHT selected SUBKEY START key={} subkey={}",
+                    key_text,
+                    location
+                );
                 let result = if location >= subkey_count {
                     Err(CreateDhtError::NotFound)
                 } else {
@@ -1764,6 +1977,13 @@ async fn read_foreign_subkeys_once(
                                 .ok_or(CreateDhtError::NotFound)
                         })
                 };
+                crate::mailbox_walk_debug!(
+                    "DHT selected SUBKEY END key={} subkey={} elapsed={}ms result={}",
+                    key_text,
+                    location,
+                    one_started.elapsed().as_millis(),
+                    if result.is_ok() { "Ok" } else { "Err" }
+                );
                 (location, result)
             }
         })
@@ -1776,7 +1996,28 @@ async fn read_foreign_subkeys_once(
             "selected foreign DHT read".to_string(),
         )),
     };
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE GET_BATCH END key={} requested={} elapsed={}ms result={}",
+        key_text,
+        location_count,
+        batch_started.elapsed().as_millis(),
+        if read_result.is_ok() { "Ok" } else { "Err" }
+    );
+
+    let close_started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE CLOSE START key={} subkeys={}",
+        key_text,
+        location_count
+    );
     let close_result = close_foreign_record(&rc, record_key).await;
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE CLOSE END key={} subkeys={} elapsed={}ms result={}",
+        key_text,
+        location_count,
+        close_started.elapsed().as_millis(),
+        if close_result.is_ok() { "Ok" } else { "Err" }
+    );
 
     let mut results = match (read_result, close_result) {
         (Err(read_error), _) => return Err(read_error),
@@ -1784,6 +2025,12 @@ async fn read_foreign_subkeys_once(
         (Ok(results), Ok(())) => results,
     };
     results.sort_by_key(|(location, _)| *location);
+    crate::mailbox_walk_debug!(
+        "DHT selected PHASE TOTAL key={} requested={} elapsed={}ms",
+        key_text,
+        location_count,
+        total_started.elapsed().as_millis()
+    );
     Ok(results)
 }
 

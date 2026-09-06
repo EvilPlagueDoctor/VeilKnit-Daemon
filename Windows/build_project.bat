@@ -19,5 +19,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Source\VeilKnitDaemon_src\b
 if errorlevel 1 exit /b %errorlevel%
 echo.
 echo Build complete:
-echo   Source\VeilKnitDaemon_src\cpp_gui\bin\x64\Release\VeilKnitGui.exe
+echo   Release\VeilKnitDaemon.exe
+echo   Release\VeilKnitNode.exe
 endlocal

@@ -223,32 +223,57 @@ pub async fn create_node(
     namespace: String,
 ) -> Result<Arc<Node>, Box<dyn std::error::Error + Send + Sync>> {
 
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|x| x.parent().map(|p| p.to_owned()))
+    let exe_dir = std::env::var_os("VEILKNIT_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|x| x.parent().map(|p| p.to_owned()))
+        })
         .unwrap_or_else(|| ".".into());
 
+	let protected_store_directory = exe_dir
+	    .join(".veilid")
+	    .join(&namespace)
+	    .join("protected_store");
+	
+	let table_store_directory = exe_dir
+	    .join(".veilid")
+	    .join(&namespace)
+	    .join("table_store");
+	
+	let block_store_directory = exe_dir
+	    .join(".veilid")
+	    .join(&namespace)
+	    .join("block_store");
+	
+	std::fs::create_dir_all(&protected_store_directory)?;
+	std::fs::create_dir_all(&table_store_directory)?;
+	std::fs::create_dir_all(&block_store_directory)?;
+
     let config = VeilidConfig {
-        program_name: "Veilid Node".into(),
+        program_name: "VeilKnitNode".into(),
         namespace: namespace.clone(),
 
         protected_store: VeilidConfigProtectedStore {
-            always_use_insecure_storage: false,
-
-            directory: exe_dir
-                .join(format!(".veilid/{}/protected_store", namespace))
+            always_use_insecure_storage: cfg!(target_os = "android"),
+            directory: protected_store_directory
                 .to_string_lossy()
-                .to_string(),
-
+                .into_owned(),
             ..Default::default()
         },
 
         table_store: VeilidConfigTableStore {
-            directory: exe_dir
-                .join(format!(".veilid/{}/table_store", namespace))
+            directory: table_store_directory
                 .to_string_lossy()
-                .to_string(),
+                .into_owned(),
+            ..Default::default()
+        },
 
+        block_store: VeilidConfigBlockStore {
+            directory: block_store_directory
+                .to_string_lossy()
+                .into_owned(),
             ..Default::default()
         },
 

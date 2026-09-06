@@ -4,15 +4,46 @@ impl MailboxRuntime {
         event: HopEvent,
         events: &broadcast::Sender<MailboxEvent>,
     ) -> Result<(), MailboxError> {
+        let total_started = std::time::Instant::now();
+        let target = event.snapshot.target.to_string();
+        crate::mailbox_walk_debug!(
+            "OBS START target={} hop={}/{} discovered_this_hop={} reachable={} own={} snapshot_values={}",
+            target,
+            event.hop_index + 1,
+            event.requested_hops,
+            event.discovered_this_hop,
+            event.snapshot.is_reachable(),
+            event.snapshot.target == self.own_main_dht,
+            event.snapshot.values.len()
+        );
+
         if !event.snapshot.is_reachable() || event.snapshot.target == self.own_main_dht {
+            crate::mailbox_walk_debug!(
+                "OBS END target={} elapsed={}ms reason=unreachable-or-self",
+                target,
+                total_started.elapsed().as_millis()
+            );
             return Ok(());
         }
         let Some(bytes) = event.snapshot.get(MAILBOX_ADVERTISEMENT_LOCATION) else {
+            crate::mailbox_walk_debug!(
+                "OBS END target={} elapsed={}ms reason=no-mailbox-advertisement",
+                target,
+                total_started.elapsed().as_millis()
+            );
             return Ok(());
         };
+
+        let parse_started = std::time::Instant::now();
         let advertisement: MailboxAdvertisement = match deserialize(bytes) {
             Ok(value) => value,
             Err(error) => {
+                crate::mailbox_walk_debug!(
+                    "OBS PARSE FAIL target={} elapsed={}ms error={}",
+                    target,
+                    parse_started.elapsed().as_millis(),
+                    error
+                );
                 self.submit_reputation(
                     event.snapshot.target.clone(),
                     ObservationKind::MalformedProtocolMessage,
@@ -22,6 +53,12 @@ impl MailboxRuntime {
             }
         };
         if let Err(error) = validate_advertisement(&advertisement, &self.config) {
+            crate::mailbox_walk_debug!(
+                "OBS VALIDATE FAIL target={} elapsed={}ms error={}",
+                target,
+                parse_started.elapsed().as_millis(),
+                error
+            );
             self.submit_reputation(
                 event.snapshot.target.clone(),
                 ObservationKind::MalformedProtocolMessage,
@@ -30,36 +67,97 @@ impl MailboxRuntime {
             return Ok(());
         }
 
+        let awaiting_response = self
+            .persistent
+            .awaiting_responses
+            .values()
+            .any(|pending| pending.recipient_main_dht == event.snapshot.target);
+        crate::mailbox_walk_debug!(
+            "OBS ADVERTISEMENT target={} parse_validate={}ms mail_send={} custodian_mailbox={} awaiting_response={} nav_hints={} generation={}",
+            target,
+            parse_started.elapsed().as_millis(),
+            advertisement.mail_send_dht.is_some(),
+            advertisement.custodian_mailbox_dht.is_some(),
+            awaiting_response,
+            advertisement.navigation_suggestions.len(),
+            advertisement.mailbox_generation
+        );
+
+        let local_started = std::time::Instant::now();
         self.record_peer_advertisement(&event.snapshot.target, &advertisement);
         self.accept_navigation_hints(&advertisement);
+        crate::mailbox_walk_debug!(
+            "OBS LOCAL target={} record-advertisement-and-hints={}ms",
+            target,
+            local_started.elapsed().as_millis()
+        );
 
         if let Some(mail_send_dht) = &advertisement.mail_send_dht {
-            self.observe_sender_outbox(
+            let stage_started = std::time::Instant::now();
+            crate::mailbox_walk_debug!(
+                "OBS STAGE START target={} stage=sender-outbox dht={}",
+                target,
+                mail_send_dht
+            );
+            let result = self.observe_sender_outbox(
                 &event.snapshot.target,
                 &advertisement,
                 mail_send_dht,
                 events,
-            )
-            .await?;
+            ).await;
+            crate::mailbox_walk_debug!(
+                "OBS STAGE END target={} stage=sender-outbox elapsed={}ms result={}",
+                target,
+                stage_started.elapsed().as_millis(),
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
+            result?;
         }
         if let Some(mailbox_dht) = &advertisement.custodian_mailbox_dht {
-            self.observe_custodian_mailbox(
+            let stage_started = std::time::Instant::now();
+            crate::mailbox_walk_debug!(
+                "OBS STAGE START target={} stage=custodian-mailbox dht={} advertised_generation={}",
+                target,
+                mailbox_dht,
+                advertisement.mailbox_generation
+            );
+            let result = self.observe_custodian_mailbox(
                 &event.snapshot.target,
                 mailbox_dht,
                 advertisement.mailbox_generation,
                 events,
-            )
-            .await?;
+            ).await;
+            crate::mailbox_walk_debug!(
+                "OBS STAGE END target={} stage=custodian-mailbox elapsed={}ms result={}",
+                target,
+                stage_started.elapsed().as_millis(),
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
+            result?;
         }
-        if self
-            .persistent
-            .awaiting_responses
-            .values()
-            .any(|pending| pending.recipient_main_dht == event.snapshot.target)
-        {
-            self.observe_response_dht(&event.snapshot.target, &advertisement, events)
-                .await?;
+        if awaiting_response {
+            let stage_started = std::time::Instant::now();
+            crate::mailbox_walk_debug!(
+                "OBS STAGE START target={} stage=response-dht dht={}",
+                target,
+                advertisement.mail_response_dht
+            );
+            let result = self.observe_response_dht(&event.snapshot.target, &advertisement, events)
+                .await;
+            crate::mailbox_walk_debug!(
+                "OBS STAGE END target={} stage=response-dht elapsed={}ms result={}",
+                target,
+                stage_started.elapsed().as_millis(),
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
+            result?;
         }
+
+        crate::mailbox_walk_debug!(
+            "OBS END target={} total_elapsed={}ms",
+            target,
+            total_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -142,14 +240,40 @@ impl MailboxRuntime {
         mail_send_dht: &RecordKey,
         events: &broadcast::Sender<MailboxEvent>,
     ) -> Result<(), MailboxError> {
+        let total_started = std::time::Instant::now();
+        crate::mailbox_walk_debug!(
+            "SENDER START sender={} mail_send_dht={}",
+            sender_main_dht,
+            mail_send_dht
+        );
+
+        let reputation_started = std::time::Instant::now();
         let access = match self.reputation.get_view(sender_main_dht.clone()).await {
             Ok(view) => view.network_access,
             Err(_) => AccessLevel::Allowed,
         };
+        crate::mailbox_walk_debug!(
+            "SENDER reputation sender={} elapsed={}ms access={:?}",
+            sender_main_dht,
+            reputation_started.elapsed().as_millis(),
+            access
+        );
         if access == AccessLevel::Blocked {
+            crate::mailbox_walk_debug!(
+                "SENDER END sender={} total_elapsed={}ms reason=blocked",
+                sender_main_dht,
+                total_started.elapsed().as_millis()
+            );
             return Ok(());
         }
 
+        let read_started = std::time::Instant::now();
+        crate::mailbox_walk_debug!(
+            "SENDER foreign-store START sender={} dht={} max_pages={}",
+            sender_main_dht,
+            mail_send_dht,
+            self.config.mailsend_pages_per_walk
+        );
         let (_, records) = match read_foreign_store::<OutgoingRecord>(
             &self.dht,
             mail_send_dht,
@@ -160,6 +284,12 @@ impl MailboxRuntime {
         {
             Ok(value) => value,
             Err(error) => {
+                crate::mailbox_walk_debug!(
+                    "SENDER foreign-store FAIL sender={} elapsed={}ms error={}",
+                    sender_main_dht,
+                    read_started.elapsed().as_millis(),
+                    error
+                );
                 self.submit_reputation(
                     sender_main_dht.clone(),
                     ObservationKind::InvalidDhtResponse,
@@ -168,7 +298,20 @@ impl MailboxRuntime {
                 return Ok(());
             }
         };
+        let message_count = records.iter().filter(|record| matches!(record, OutgoingRecord::Message(_))).count();
+        let withdrawal_count = records.iter().filter(|record| matches!(record, OutgoingRecord::Withdrawal(_))).count();
+        let service_count = records.iter().filter(|record| matches!(record, OutgoingRecord::ServiceRequest(_))).count();
+        crate::mailbox_walk_debug!(
+            "SENDER foreign-store END sender={} elapsed={}ms records={} messages={} withdrawals={} services={}",
+            sender_main_dht,
+            read_started.elapsed().as_millis(),
+            records.len(),
+            message_count,
+            withdrawal_count,
+            service_count
+        );
 
+        let withdrawal_started = std::time::Instant::now();
         let withdrawals: HashSet<[u8; 32]> = records
             .iter()
             .filter_map(|record| match record {
@@ -176,6 +319,7 @@ impl MailboxRuntime {
                 _ => None,
             })
             .collect();
+        let mut verified_withdrawals = 0usize;
         for withdrawal in records.iter().filter_map(|record| match record {
             OutgoingRecord::Withdrawal(withdrawal) => Some(withdrawal),
             _ => None,
@@ -184,13 +328,24 @@ impl MailboxRuntime {
                 .verify_withdrawal(withdrawal, sender_advertisement)
                 .unwrap_or(false)
             {
+                verified_withdrawals += 1;
                 self.recent_service_requests.remove(&withdrawal.message_id);
                 self.remove_pointer_everywhere(withdrawal.message_id)
                     .await?;
             }
         }
+        crate::mailbox_walk_debug!(
+            "SENDER withdrawals sender={} elapsed={}ms seen={} verified={}",
+            sender_main_dht,
+            withdrawal_started.elapsed().as_millis(),
+            withdrawal_count,
+            verified_withdrawals
+        );
 
+        let messages_started = std::time::Instant::now();
         let mut processed = 0usize;
+        let mut accepted_messages = 0usize;
+        let mut rejected_messages = 0usize;
         for message in records.iter().filter_map(|record| match record {
             OutgoingRecord::Message(message) => Some(message.clone()),
             _ => None,
@@ -200,8 +355,20 @@ impl MailboxRuntime {
             }
             processed += 1;
             if withdrawals.contains(&message.message_id) {
+                crate::mailbox_walk_debug!(
+                    "SENDER message SKIP sender={} candidate={} reason=withdrawn",
+                    sender_main_dht,
+                    processed
+                );
                 continue;
             }
+            let candidate_started = std::time::Instant::now();
+            crate::mailbox_walk_debug!(
+                "SENDER message START sender={} candidate={} recipient={}",
+                sender_main_dht,
+                processed,
+                message.recipient_main_dht
+            );
             match self
                 .validate_candidate_message(
                     sender_main_dht,
@@ -212,6 +379,13 @@ impl MailboxRuntime {
                 .await
             {
                 Ok(recipient_advertisement) => {
+                    let validate_elapsed = candidate_started.elapsed().as_millis();
+                    crate::mailbox_walk_debug!(
+                        "SENDER message VALID sender={} candidate={} elapsed={}ms; accepting pointer",
+                        sender_main_dht,
+                        processed,
+                        validate_elapsed
+                    );
                     self.accept_valid_message_pointer(
                         mail_send_dht,
                         &message,
@@ -219,8 +393,23 @@ impl MailboxRuntime {
                         events,
                     )
                     .await?;
+                    accepted_messages += 1;
+                    crate::mailbox_walk_debug!(
+                        "SENDER message END sender={} candidate={} total_elapsed={}ms result=accepted",
+                        sender_main_dht,
+                        processed,
+                        candidate_started.elapsed().as_millis()
+                    );
                 }
                 Err(error) => {
+                    rejected_messages += 1;
+                    crate::mailbox_walk_debug!(
+                        "SENDER message END sender={} candidate={} total_elapsed={}ms result=rejected error={}",
+                        sender_main_dht,
+                        processed,
+                        candidate_started.elapsed().as_millis(),
+                        error
+                    );
                     let severe = matches!(
                         error,
                         MailboxError::InvalidMessage(_) | MailboxError::Crypto(_)
@@ -237,8 +426,20 @@ impl MailboxRuntime {
                 }
             }
         }
+        crate::mailbox_walk_debug!(
+            "SENDER messages END sender={} elapsed={}ms processed={} accepted={} rejected={} configured_limit={}",
+            sender_main_dht,
+            messages_started.elapsed().as_millis(),
+            processed,
+            accepted_messages,
+            rejected_messages,
+            self.config.candidate_messages_per_walk
+        );
 
+        let services_started = std::time::Instant::now();
         let mut processed_services = 0usize;
+        let mut accepted_services = 0usize;
+        let mut rejected_services = 0usize;
         for request in records.iter().filter_map(|record| match record {
             OutgoingRecord::ServiceRequest(request) => Some(request.clone()),
             _ => None,
@@ -250,6 +451,7 @@ impl MailboxRuntime {
             if withdrawals.contains(&request.request_id) {
                 continue;
             }
+            let candidate_started = std::time::Instant::now();
             match self.validate_candidate_service_request(
                 sender_main_dht,
                 sender_advertisement,
@@ -259,8 +461,23 @@ impl MailboxRuntime {
                 Ok(()) => {
                     self.accept_valid_service_request_pointer(mail_send_dht, &request, events)
                         .await?;
+                    accepted_services += 1;
+                    crate::mailbox_walk_debug!(
+                        "SENDER service END sender={} candidate={} elapsed={}ms result=accepted",
+                        sender_main_dht,
+                        processed_services,
+                        candidate_started.elapsed().as_millis()
+                    );
                 }
                 Err(error) => {
+                    rejected_services += 1;
+                    crate::mailbox_walk_debug!(
+                        "SENDER service END sender={} candidate={} elapsed={}ms result=rejected error={}",
+                        sender_main_dht,
+                        processed_services,
+                        candidate_started.elapsed().as_millis(),
+                        error
+                    );
                     self.submit_reputation(
                         sender_main_dht.clone(),
                         ObservationKind::MessageRejected,
@@ -269,6 +486,20 @@ impl MailboxRuntime {
                 }
             }
         }
+        crate::mailbox_walk_debug!(
+            "SENDER services END sender={} elapsed={}ms processed={} accepted={} rejected={}",
+            sender_main_dht,
+            services_started.elapsed().as_millis(),
+            processed_services,
+            accepted_services,
+            rejected_services
+        );
+
+        crate::mailbox_walk_debug!(
+            "SENDER END sender={} total_elapsed={}ms",
+            sender_main_dht,
+            total_started.elapsed().as_millis()
+        );
         Ok(())
     }
 

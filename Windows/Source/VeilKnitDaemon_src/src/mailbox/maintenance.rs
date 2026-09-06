@@ -1,3 +1,70 @@
+#[derive(Clone)]
+struct ResolvedCustodianEntry {
+    is_ours: bool,
+    pointers: Vec<MailSourcePointer>,
+}
+
+fn pointer_service_group_key(pointer: &MailSourcePointer) -> String {
+    format!("{}|{}", pointer.sender_main_dht, pointer.mail_send_dht)
+}
+
+async fn load_cached_sender_advertisement(
+    dht: DHTModule,
+    config: MailboxConfig,
+    sender_main_dht: RecordKey,
+) -> Result<MailboxAdvertisement, String> {
+    let started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "ADVERTISEMENT_CACHE FETCH START sender={}",
+        sender_main_dht
+    );
+    let bytes = dht
+        .read_foreign_subkey(
+            sender_main_dht.clone(),
+            MAILBOX_ADVERTISEMENT_LOCATION,
+            true,
+        )
+        .await
+        .map_err(|error| format!("advertisement DHT read failed: {error:?}"))?;
+    let advertisement: MailboxAdvertisement =
+        deserialize(&bytes).map_err(|error| error.to_string())?;
+    validate_advertisement(&advertisement, &config).map_err(|error| error.to_string())?;
+    crate::mailbox_walk_debug!(
+        "ADVERTISEMENT_CACHE FETCH END sender={} elapsed={}ms mail_send={}",
+        sender_main_dht,
+        started.elapsed().as_millis(),
+        advertisement.mail_send_dht.is_some()
+    );
+    Ok(advertisement)
+}
+
+async fn load_cached_outgoing_store(
+    dht: DHTModule,
+    config: MailboxConfig,
+    mail_send_dht: RecordKey,
+) -> Result<Vec<OutgoingRecord>, String> {
+    let started = std::time::Instant::now();
+    crate::mailbox_walk_debug!(
+        "MAILSEND_CACHE FETCH START mail_send={}",
+        mail_send_dht
+    );
+    let (_, records) = read_foreign_store::<OutgoingRecord>(
+        &dht,
+        &mail_send_dht,
+        config.mailsend_pages_per_walk,
+        &config,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    crate::mailbox_walk_debug!(
+        "MAILSEND_CACHE FETCH END mail_send={} elapsed={}ms records={}",
+        mail_send_dht,
+        started.elapsed().as_millis(),
+        records.len()
+    );
+    Ok(records)
+}
+
 impl MailboxRuntime {
     async fn observe_custodian_mailbox(
         &mut self,
@@ -6,6 +73,18 @@ impl MailboxRuntime {
         advertised_generation: u64,
         events: &broadcast::Sender<MailboxEvent>,
     ) -> Result<(), MailboxError> {
+        const SERVICE_GROUP_CONCURRENCY: usize = 4;
+
+        let total_started = std::time::Instant::now();
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN START custodian={} mailbox_dht={} advertised_generation={} max_pages={}",
+            custodian_main_dht,
+            mailbox_dht,
+            advertised_generation,
+            self.config.mailbox_pages_per_walk
+        );
+
+        let store_started = std::time::Instant::now();
         let (index, entries) = match read_foreign_store::<MailboxRecipientEntry>(
             &self.dht,
             mailbox_dht,
@@ -16,6 +95,12 @@ impl MailboxRuntime {
         {
             Ok(value) => value,
             Err(error) => {
+                crate::mailbox_walk_debug!(
+                    "CUSTODIAN store FAIL custodian={} elapsed={}ms error={}",
+                    custodian_main_dht,
+                    store_started.elapsed().as_millis(),
+                    error
+                );
                 self.mark_mailbox_read_failure(custodian_main_dht);
                 self.submit_reputation(
                     custodian_main_dht.clone(),
@@ -25,6 +110,14 @@ impl MailboxRuntime {
                 return Ok(());
             }
         };
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN store END custodian={} elapsed={}ms generation={} entries={}",
+            custodian_main_dht,
+            store_started.elapsed().as_millis(),
+            index.generation,
+            entries.len()
+        );
+
         if advertised_generation > index.generation.saturating_add(1) {
             self.submit_reputation(
                 custodian_main_dht.clone(),
@@ -52,32 +145,46 @@ impl MailboxRuntime {
 
         let outgoing_ids: HashSet<[u8; 32]> =
             self.persistent.outgoing_messages.keys().copied().collect();
-        let mut service_checks = 0usize;
-        for entry in entries {
+        let mut resolved_entries = Vec::<ResolvedCustodianEntry>::new();
+        let mut total_pointers = 0usize;
+        let mut custodian_matches = 0usize;
+
+        // First resolve every recipient entry without doing any sender/MailSend
+        // lookup. This lets us see all pointers up front, deduplicate them, and
+        // spend the bounded check budget fairly instead of allowing one noisy
+        // entry to consume it with repeated references to the same service.
+        for (entry_index, entry) in entries.into_iter().enumerate() {
+            let entry_started = std::time::Instant::now();
+            let is_ours = entry.recipient_main_dht == self.own_main_dht;
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN entry START custodian={} entry={} recipient={} ours={} storage={}",
+                custodian_main_dht,
+                entry_index,
+                entry.recipient_main_dht,
+                is_ours,
+                match &entry.storage {
+                    RecipientSourceStorage::Inline { .. } => "inline",
+                    RecipientSourceStorage::Overflow { .. } => "overflow",
+                }
+            );
+
+            let resolve_started = std::time::Instant::now();
             let pointers = self
                 .resolve_recipient_sources(mailbox_dht, &entry)
                 .await
                 .unwrap_or_default();
+            total_pointers += pointers.len();
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN entry RESOLVE custodian={} entry={} elapsed={}ms pointers={}",
+                custodian_main_dht,
+                entry_index,
+                resolve_started.elapsed().as_millis(),
+                pointers.len()
+            );
+
             for pointer in &pointers {
-                if service_checks >= self.config.service_request_pointer_checks_per_walk {
-                    break;
-                }
-                if self.recent_service_requests.contains_key(&pointer.message_id) {
-                    continue;
-                }
-                service_checks += 1;
-                let _ = self.retrieve_pointer_service_request(pointer, events).await;
-            }
-            if entry.recipient_main_dht == self.own_main_dht {
-                for pointer in pointers
-                    .iter()
-                    .take(self.config.candidate_messages_per_walk)
-                {
-                    self.retrieve_pointer_message(pointer, events).await?;
-                }
-            }
-            for pointer in pointers {
                 if outgoing_ids.contains(&pointer.message_id) {
+                    custodian_matches += 1;
                     self.record_custodian_observation(
                         pointer.message_id,
                         custodian_main_dht,
@@ -87,7 +194,352 @@ impl MailboxRuntime {
                     );
                 }
             }
+
+            resolved_entries.push(ResolvedCustodianEntry {
+                is_ours,
+                pointers,
+            });
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN entry RESOLVED custodian={} entry={} elapsed={}ms",
+                custodian_main_dht,
+                entry_index,
+                entry_started.elapsed().as_millis()
+            );
         }
+
+        // Select service-request pointers round-robin across entries. Duplicate
+        // message ids only consume the budget once, so a repeated pointer list
+        // can no longer starve later recipient entries.
+        let service_limit = self.config.service_request_pointer_checks_per_walk;
+        let mut selected_service = Vec::<MailSourcePointer>::new();
+        let mut service_seen = HashSet::<[u8; 32]>::new();
+        let mut cursors = vec![0usize; resolved_entries.len()];
+        while selected_service.len() < service_limit {
+            let mut progressed = false;
+            for (entry_pos, entry) in resolved_entries.iter().enumerate() {
+                while cursors[entry_pos] < entry.pointers.len() {
+                    let pointer = &entry.pointers[cursors[entry_pos]];
+                    cursors[entry_pos] += 1;
+                    if self.recent_service_requests.contains_key(&pointer.message_id)
+                        || !service_seen.insert(pointer.message_id)
+                    {
+                        continue;
+                    }
+                    selected_service.push(pointer.clone());
+                    progressed = true;
+                    break;
+                }
+                if selected_service.len() >= service_limit {
+                    break;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        // Private-message candidates keep the existing per-recipient limit, but
+        // duplicate message ids are collapsed before any network work begins.
+        let mut selected_messages = Vec::<MailSourcePointer>::new();
+        let mut message_seen = HashSet::<[u8; 32]>::new();
+        for entry in &resolved_entries {
+            if !entry.is_ours {
+                continue;
+            }
+            let mut accepted_for_entry = 0usize;
+            for pointer in &entry.pointers {
+                if accepted_for_entry >= self.config.candidate_messages_per_walk {
+                    break;
+                }
+                if !message_seen.insert(pointer.message_id) {
+                    continue;
+                }
+                selected_messages.push(pointer.clone());
+                accepted_for_entry += 1;
+            }
+        }
+
+        let selected_pointer_count = selected_service.len() + selected_messages.len();
+        let unique_message_ids: HashSet<[u8; 32]> = selected_service
+            .iter()
+            .chain(selected_messages.iter())
+            .map(|pointer| pointer.message_id)
+            .collect();
+
+        // Build an observation-local cache keyed by the *service*, not by the
+        // pointer. Every pointer sharing a sender + MailSend DHT will reuse the
+        // same advertisement and the same loaded OutgoingRecord generation.
+        let mut unique_groups = BTreeMap::<String, (RecordKey, RecordKey)>::new();
+        for pointer in selected_service.iter().chain(selected_messages.iter()) {
+            unique_groups
+                .entry(pointer_service_group_key(pointer))
+                .or_insert_with(|| {
+                    (
+                        pointer.sender_main_dht.clone(),
+                        pointer.mail_send_dht.clone(),
+                    )
+                });
+        }
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN PLAN custodian={} raw_pointers={} selected_pointers={} unique_message_ids={} unique_service_groups={} service_limit={} group_concurrency={}",
+            custodian_main_dht,
+            total_pointers,
+            selected_pointer_count,
+            unique_message_ids.len(),
+            unique_groups.len(),
+            service_limit,
+            SERVICE_GROUP_CONCURRENCY
+        );
+
+        // Two-phase observation-local cache:
+        //   1) fetch each unique sender advertisement once;
+        //   2) fetch each unique MailSend store once, but only when at least one
+        //      cached sender still advertises that exact store.
+        // This is slightly better than caching whole (sender, store) groups,
+        // because one sender referenced through multiple pointers still pays for
+        // its main-DHT advertisement exactly once.
+        let cache_started = std::time::Instant::now();
+        let mut unique_senders = BTreeMap::<String, RecordKey>::new();
+        for (_, (sender, _)) in &unique_groups {
+            unique_senders
+                .entry(sender.to_string())
+                .or_insert_with(|| sender.clone());
+        }
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN CACHE PLAN custodian={} unique_senders={} unique_service_groups={}",
+            custodian_main_dht,
+            unique_senders.len(),
+            unique_groups.len()
+        );
+
+        let dht = self.dht.clone();
+        let config = self.config.clone();
+        let advertisement_fetches = stream::iter(unique_senders.into_iter().map(|(key, sender)| {
+            let dht = dht.clone();
+            let config = config.clone();
+            async move {
+                let result = load_cached_sender_advertisement(dht, config, sender.clone()).await;
+                (key, sender, result)
+            }
+        }))
+        .buffer_unordered(SERVICE_GROUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut advertisement_cache =
+            HashMap::<String, Result<MailboxAdvertisement, String>>::new();
+        for (key, sender, result) in advertisement_fetches {
+            crate::mailbox_walk_debug!(
+                "ADVERTISEMENT_CACHE STORE custodian={} sender={} result={}",
+                custodian_main_dht,
+                sender,
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
+            advertisement_cache.insert(key, result);
+        }
+
+        let mut unique_stores = BTreeMap::<String, RecordKey>::new();
+        for (_, (sender, mail_send)) in &unique_groups {
+            let sender_key = sender.to_string();
+            let Some(Ok(advertisement)) = advertisement_cache.get(&sender_key) else {
+                continue;
+            };
+            if advertisement.mail_send_dht.as_ref() == Some(mail_send) {
+                unique_stores
+                    .entry(mail_send.to_string())
+                    .or_insert_with(|| mail_send.clone());
+            }
+        }
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN CACHE ADVERTISEMENTS END custodian={} elapsed={}ms cached_senders={} unique_mail_send_stores={}",
+            custodian_main_dht,
+            cache_started.elapsed().as_millis(),
+            advertisement_cache.len(),
+            unique_stores.len()
+        );
+
+        let store_fetch_started = std::time::Instant::now();
+        let dht = self.dht.clone();
+        let config = self.config.clone();
+        let store_fetches = stream::iter(unique_stores.into_iter().map(|(key, mail_send)| {
+            let dht = dht.clone();
+            let config = config.clone();
+            async move {
+                let result = load_cached_outgoing_store(dht, config, mail_send.clone()).await;
+                (key, mail_send, result)
+            }
+        }))
+        .buffer_unordered(SERVICE_GROUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut outgoing_store_cache = HashMap::<String, Result<Vec<OutgoingRecord>, String>>::new();
+        for (key, mail_send, result) in store_fetches {
+            crate::mailbox_walk_debug!(
+                "MAILSEND_CACHE STORE custodian={} mail_send={} result={}",
+                custodian_main_dht,
+                mail_send,
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
+            outgoing_store_cache.insert(key, result);
+        }
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN GROUP FETCH END custodian={} total_cache_elapsed={}ms store_fetch_elapsed={}ms cached_senders={} cached_stores={}",
+            custodian_main_dht,
+            cache_started.elapsed().as_millis(),
+            store_fetch_started.elapsed().as_millis(),
+            advertisement_cache.len(),
+            outgoing_store_cache.len()
+        );
+
+        let mut service_checks = 0usize;
+        let mut service_cache_hits = 0usize;
+        for (pointer_index, pointer) in selected_service.iter().enumerate() {
+            let pointer_started = std::time::Instant::now();
+            let sender_key = pointer.sender_main_dht.to_string();
+            let store_key = pointer.mail_send_dht.to_string();
+            service_checks += 1;
+            service_cache_hits += 1;
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN service-pointer CACHE custodian={} pointer={} sender={} mail_send={}",
+                custodian_main_dht,
+                pointer_index,
+                pointer.sender_main_dht,
+                pointer.mail_send_dht
+            );
+            let result: Result<(), MailboxError> = match advertisement_cache.get(&sender_key) {
+                Some(Err(error)) => {
+                    crate::mailbox_walk_debug!(
+                        "CUSTODIAN service-pointer ADVERTISEMENT-ERROR custodian={} pointer={} error={}",
+                        custodian_main_dht,
+                        pointer_index,
+                        error
+                    );
+                    Ok(())
+                }
+                None => Ok(()),
+                Some(Ok(advertisement)) => {
+                    if advertisement.mail_send_dht.as_ref() != Some(&pointer.mail_send_dht) {
+                        Ok(())
+                    } else {
+                        match outgoing_store_cache.get(&store_key) {
+                            Some(Err(error)) => {
+                                crate::mailbox_walk_debug!(
+                                    "CUSTODIAN service-pointer STORE-ERROR custodian={} pointer={} error={}",
+                                    custodian_main_dht,
+                                    pointer_index,
+                                    error
+                                );
+                                Ok(())
+                            }
+                            None => Ok(()),
+                            Some(Ok(records)) => {
+                                let record = records.iter().find(|record| {
+                                    record.page_key().as_slice() == pointer.message_id.as_slice()
+                                });
+                                match record {
+                                    Some(OutgoingRecord::ServiceRequest(request)) => {
+                                        match self.validate_candidate_service_request(
+                                            &pointer.sender_main_dht,
+                                            advertisement,
+                                            &pointer.mail_send_dht,
+                                            request,
+                                        ) {
+                                            Ok(()) => {
+                                                self.record_verified_service_request(
+                                                    request.clone(),
+                                                    events,
+                                                );
+                                                Ok(())
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    _ => Ok(()),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN service-pointer END custodian={} pointer={} elapsed={}ms result={}",
+                custodian_main_dht,
+                pointer_index,
+                pointer_started.elapsed().as_millis(),
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
+        }
+
+        let mut message_checks = 0usize;
+        let mut message_cache_hits = 0usize;
+        for (pointer_index, pointer) in selected_messages.iter().enumerate() {
+            if self
+                .recently_decrypted
+                .contains(&pointer.message_id, current_timestamp())
+            {
+                continue;
+            }
+            message_checks += 1;
+            let pointer_started = std::time::Instant::now();
+            let sender_key = pointer.sender_main_dht.to_string();
+            let store_key = pointer.mail_send_dht.to_string();
+            message_cache_hits += 1;
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN message-pointer CACHE custodian={} pointer={} sender={} mail_send={}",
+                custodian_main_dht,
+                pointer_index,
+                pointer.sender_main_dht,
+                pointer.mail_send_dht
+            );
+            let advertisement = match advertisement_cache.get(&sender_key) {
+                Some(Ok(advertisement)) => advertisement,
+                Some(Err(error)) => return Err(MailboxError::Dht(error.clone())),
+                None => continue,
+            };
+            if advertisement.mail_send_dht.as_ref() != Some(&pointer.mail_send_dht) {
+                continue;
+            }
+            let records = match outgoing_store_cache.get(&store_key) {
+                Some(Ok(records)) => records,
+                Some(Err(error)) => return Err(MailboxError::Dht(error.clone())),
+                None => continue,
+            };
+            let record = records.iter().find(|record| {
+                record.page_key().as_slice() == pointer.message_id.as_slice()
+            });
+            let Some(OutgoingRecord::Message(message)) = record else {
+                continue;
+            };
+            self.validate_candidate_message(
+                &pointer.sender_main_dht,
+                advertisement,
+                &pointer.mail_send_dht,
+                message,
+            )
+            .await?;
+            self.decrypt_and_emit(message, events).await?;
+            crate::mailbox_walk_debug!(
+                "CUSTODIAN message-pointer END custodian={} pointer={} elapsed={}ms result=Ok",
+                custodian_main_dht,
+                pointer_index,
+                pointer_started.elapsed().as_millis()
+            );
+        }
+
+        crate::mailbox_walk_debug!(
+            "CUSTODIAN END custodian={} total_elapsed={}ms entries={} raw_pointers={} service_checks={} service_cache_hits={} message_checks={} message_cache_hits={} unique_groups={} outgoing_matches={}",
+            custodian_main_dht,
+            total_started.elapsed().as_millis(),
+            resolved_entries.len(),
+            total_pointers,
+            service_checks,
+            service_cache_hits,
+            message_checks,
+            message_cache_hits,
+            unique_groups.len(),
+            custodian_matches
+        );
         Ok(())
     }
 
@@ -133,80 +585,6 @@ impl MailboxRuntime {
                 Ok(sources)
             }
         }
-    }
-
-    async fn retrieve_pointer_service_request(
-        &mut self,
-        pointer: &MailSourcePointer,
-        events: &broadcast::Sender<MailboxEvent>,
-    ) -> Result<(), MailboxError> {
-        let sender_advertisement = self
-            .read_mailbox_advertisement(&pointer.sender_main_dht)
-            .await?;
-        if sender_advertisement.mail_send_dht.as_ref() != Some(&pointer.mail_send_dht) {
-            return Ok(());
-        }
-        let (_, records) = read_foreign_store::<OutgoingRecord>(
-            &self.dht,
-            &pointer.mail_send_dht,
-            self.config.mailsend_pages_per_walk,
-            &self.config,
-        )
-        .await?;
-        let record = records
-            .into_iter()
-            .find(|record| record.page_key().as_slice() == pointer.message_id.as_slice());
-        let Some(OutgoingRecord::ServiceRequest(request)) = record else {
-            return Ok(());
-        };
-        self.validate_candidate_service_request(
-            &pointer.sender_main_dht,
-            &sender_advertisement,
-            &pointer.mail_send_dht,
-            &request,
-        )?;
-        self.record_verified_service_request(request, events);
-        Ok(())
-    }
-
-    async fn retrieve_pointer_message(
-        &mut self,
-        pointer: &MailSourcePointer,
-        events: &broadcast::Sender<MailboxEvent>,
-    ) -> Result<(), MailboxError> {
-        if self
-            .recently_decrypted
-            .contains(&pointer.message_id, current_timestamp())
-        {
-            return Ok(());
-        }
-        let sender_advertisement = self
-            .read_mailbox_advertisement(&pointer.sender_main_dht)
-            .await?;
-        if sender_advertisement.mail_send_dht.as_ref() != Some(&pointer.mail_send_dht) {
-            return Ok(());
-        }
-        let (_, records) = read_foreign_store::<OutgoingRecord>(
-            &self.dht,
-            &pointer.mail_send_dht,
-            self.config.mailsend_pages_per_walk,
-            &self.config,
-        )
-        .await?;
-        let record = records
-            .into_iter()
-            .find(|record| record.page_key().as_slice() == pointer.message_id.as_slice());
-        let Some(OutgoingRecord::Message(message)) = record else {
-            return Ok(());
-        };
-        self.validate_candidate_message(
-            &pointer.sender_main_dht,
-            &sender_advertisement,
-            &pointer.mail_send_dht,
-            &message,
-        )
-        .await?;
-        self.decrypt_and_emit(&message, events).await
     }
 
     fn record_custodian_observation(

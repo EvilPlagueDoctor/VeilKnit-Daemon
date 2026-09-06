@@ -42,6 +42,9 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 aes-gcm = "0.10"
 blake3 = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+deunicode = "1"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 
 x25519-dalek = { version = "2", features = ["static_secrets"] }  # or whatever features EphemeralSecret::random_from_rng needs in your locked version

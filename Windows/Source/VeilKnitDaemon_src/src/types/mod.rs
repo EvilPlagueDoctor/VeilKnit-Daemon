@@ -53,6 +53,9 @@ pub const APPINFO_LOCATION: u32 = 10;
 /// Subkey 11 - pointer to the daemon-owned App Directory DHT.
 pub const APP_DIRECTORY_LOCATION: u32 = 11;
 
+/// Subkey 12 - compact advertisement of daemon-owned per-app lexical libraries.
+pub const LEXICAL_LIBRARY_ADVERTISEMENT_LOCATION: u32 = 12;
+
 /// Patch-C record-table manifest slot A.
 pub const RECORD_TABLE_MANIFEST_SLOT_A: u32 = 50;
 

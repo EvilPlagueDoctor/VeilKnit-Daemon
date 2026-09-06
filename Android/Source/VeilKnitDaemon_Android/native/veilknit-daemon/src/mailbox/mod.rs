@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{broadcast, mpsc, oneshot, RwLock},
+    sync::{broadcast, mpsc, oneshot, watch, RwLock},
     time::{self, MissedTickBehavior},
 };
 use veilid_core::{Crypto, KeyPair, PublicKey, RecordKey, RouteId, Signature, VeilidAPI, CRYPTO_KIND_VLD0};

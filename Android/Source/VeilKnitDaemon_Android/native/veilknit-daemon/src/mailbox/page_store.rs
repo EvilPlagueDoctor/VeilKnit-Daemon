@@ -261,8 +261,49 @@ impl<T: PageEntry> CowPagedStore<T> {
         auth: &UserAuth,
         session: &UserSession,
     ) -> Result<bool, MailboxError> {
-        if self.pending_changes() == 0 {
+        self.commit_inner(dht, config, transactions, auth, session, None)
+            .await
+    }
+
+    async fn commit_shutdown_traced(
+        &mut self,
+        dht: &DHTModule,
+        config: &MailboxConfig,
+        transactions: &mut Vec<PendingCowTransaction>,
+        auth: &UserAuth,
+        session: &UserSession,
+        context: &'static str,
+    ) -> Result<bool, MailboxError> {
+        self.commit_inner(dht, config, transactions, auth, session, Some(context))
+            .await
+    }
+
+    async fn commit_inner(
+        &mut self,
+        dht: &DHTModule,
+        config: &MailboxConfig,
+        transactions: &mut Vec<PendingCowTransaction>,
+        auth: &UserAuth,
+        session: &UserSession,
+        trace_context: Option<&'static str>,
+    ) -> Result<bool, MailboxError> {
+        let pending_before = self.pending_changes();
+        if pending_before == 0 {
+            if let Some(context) = trace_context {
+                crate::shutdown_debug!("mailbox commit[{context}]: store={} SKIP no pending pages", self.name);
+            }
             return Ok(false);
+        }
+
+        let commit_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox commit[{context}]: store={} START package={} pending_pages={} current_generation={}",
+                self.name,
+                self.package_index,
+                pending_before,
+                self.generation()
+            );
         }
 
         self.rebalance_dirty_pages(config)?;
@@ -354,7 +395,25 @@ impl<T: PageEntry> CowPagedStore<T> {
         // Startup still trusts only fully validated A/B generations, but this
         // log makes orphan inspection and interrupted-write diagnostics exact.
         persist_transaction_log(auth, session, transactions)?;
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox commit[{context}]: store={} transaction recorded; page_writes={} target_index_slot={} generation={}",
+                self.name,
+                page_writes.len(),
+                target_slot,
+                next_generation
+            );
+        }
 
+        let page_write_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox commit[{context}]: store={} PAGE WRITES START count={} concurrency={}",
+                self.name,
+                page_writes.len(),
+                config.dht_io_concurrency.max(1)
+            );
+        }
         let writes = stream::iter(page_writes.clone().into_iter().map(|(descriptor, bytes)| {
             let dht = dht.clone();
             let package = self.package_index;
@@ -371,14 +430,32 @@ impl<T: PageEntry> CowPagedStore<T> {
         for result in writes {
             result?;
         }
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox commit[{context}]: store={} PAGE WRITES END elapsed={}ms",
+                self.name,
+                page_write_started.elapsed().as_millis()
+            );
+        }
 
         // Read back every newly written page before making it reachable.
+        let page_readback_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} PAGE READBACK START count={}", self.name, page_writes.len());
+        }
         for (descriptor, _) in &page_writes {
             let bytes = dht
                 .read_from_dht(self.package_index, descriptor.subkey, true)
                 .await?;
             let page: CowDataPage<T> = deserialize(&bytes)?;
             validate_page(&page, descriptor)?;
+        }
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox commit[{context}]: store={} PAGE READBACK END elapsed={}ms",
+                self.name,
+                page_readback_started.elapsed().as_millis()
+            );
         }
 
         let mut index = CowIndex {
@@ -399,9 +476,20 @@ impl<T: PageEntry> CowPagedStore<T> {
                 dht_value_limit,
             )));
         }
+        let index_write_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX WRITE START slot={} bytes={}", self.name, target_slot, index_bytes.len());
+        }
         dht.write_to_dht(self.package_index, target_slot, index_bytes)
             .await?;
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX WRITE END elapsed={}ms", self.name, index_write_started.elapsed().as_millis());
+        }
 
+        let index_read_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX READBACK START slot={}", self.name, target_slot);
+        }
         let readback = dht
             .read_from_dht(self.package_index, target_slot, true)
             .await?;
@@ -411,6 +499,14 @@ impl<T: PageEntry> CowPagedStore<T> {
                 "index readback digest mismatch".to_string(),
             ));
         }
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} INDEX READBACK END elapsed={}ms", self.name, index_read_started.elapsed().as_millis());
+        }
+
+        let validate_started = std::time::Instant::now();
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} GENERATION VALIDATION START pages={}", self.name, readback_index.pages.len());
+        }
         let verified_pages = load_and_validate_owned_pages::<T>(
             dht,
             self.package_index,
@@ -418,6 +514,9 @@ impl<T: PageEntry> CowPagedStore<T> {
             config,
         )
         .await?;
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!("mailbox commit[{context}]: store={} GENERATION VALIDATION END elapsed={}ms", self.name, validate_started.elapsed().as_millis());
+        }
 
         self.previous_index = self.current_index.take();
         self.current_index = Some(readback_index);
@@ -427,6 +526,14 @@ impl<T: PageEntry> CowPagedStore<T> {
             !(transaction.store_name == self.name && transaction.generation == next_generation)
         });
         persist_transaction_log(auth, session, transactions)?;
+        if let Some(context) = trace_context {
+            crate::shutdown_debug!(
+                "mailbox commit[{context}]: store={} END total_elapsed={}ms new_generation={}",
+                self.name,
+                commit_started.elapsed().as_millis(),
+                next_generation
+            );
+        }
         Ok(true)
     }
 
@@ -595,6 +702,16 @@ async fn read_foreign_store<T: PageEntry>(
     maximum_pages: usize,
     _config: &MailboxConfig,
 ) -> Result<(CowIndex, Vec<T>), MailboxError> {
+    let total_started = std::time::Instant::now();
+    let entry_type = std::any::type_name::<T>();
+    crate::mailbox_walk_debug!(
+        "FOREIGN_STORE START type={} dht={} max_pages={}",
+        entry_type,
+        record_key,
+        maximum_pages
+    );
+
+    let index_started = std::time::Instant::now();
     let index_reads = dht
         .read_foreign_subkeys(
             record_key.clone(),
@@ -602,6 +719,14 @@ async fn read_foreign_store<T: PageEntry>(
             true,
         )
         .await?;
+    crate::mailbox_walk_debug!(
+        "FOREIGN_STORE INDEX_READ END type={} dht={} elapsed={}ms returned_subkeys={}",
+        entry_type,
+        record_key,
+        index_started.elapsed().as_millis(),
+        index_reads.len()
+    );
+
     let mut indexes = Vec::new();
     for (_, result) in index_reads {
         let Ok(bytes) = result else { continue };
@@ -611,16 +736,48 @@ async fn read_foreign_store<T: PageEntry>(
         }
     }
     indexes.sort_by(|a, b| b.generation.cmp(&a.generation));
+    crate::mailbox_walk_debug!(
+        "FOREIGN_STORE INDEX_VALIDATE type={} dht={} valid_generations={} candidates={:?}",
+        entry_type,
+        record_key,
+        indexes.len(),
+        indexes.iter().map(|index| (index.generation, index.pages.len())).collect::<Vec<_>>()
+    );
 
     for index in indexes {
         if index.pages.len() > maximum_pages {
+            crate::mailbox_walk_debug!(
+                "FOREIGN_STORE GENERATION SKIP type={} dht={} generation={} pages={} reason=over-max-pages",
+                entry_type,
+                record_key,
+                index.generation,
+                index.pages.len()
+            );
             continue;
         }
         let locations: Vec<u32> = index.pages.iter().map(|page| page.subkey).collect();
+        let page_started = std::time::Instant::now();
+        crate::mailbox_walk_debug!(
+            "FOREIGN_STORE PAGE_READ START type={} dht={} generation={} pages={} subkeys={:?}",
+            entry_type,
+            record_key,
+            index.generation,
+            locations.len(),
+            locations
+        );
         let reads = dht
             .read_foreign_subkeys(record_key.clone(), locations, true)
             .await?;
+        crate::mailbox_walk_debug!(
+            "FOREIGN_STORE PAGE_READ END type={} dht={} generation={} elapsed={}ms returned_subkeys={}",
+            entry_type,
+            record_key,
+            index.generation,
+            page_started.elapsed().as_millis(),
+            reads.len()
+        );
         let by_subkey: HashMap<u32, Result<Vec<u8>, CreateDhtError>> = reads.into_iter().collect();
+        let validate_started = std::time::Instant::now();
         let mut entries = Vec::new();
         let mut valid = true;
         for descriptor in &index.pages {
@@ -642,11 +799,34 @@ async fn read_foreign_store<T: PageEntry>(
             }
             entries.extend(page.entries);
         }
+        crate::mailbox_walk_debug!(
+            "FOREIGN_STORE PAGE_VALIDATE type={} dht={} generation={} elapsed={}ms valid={} entries={}",
+            entry_type,
+            record_key,
+            index.generation,
+            validate_started.elapsed().as_millis(),
+            valid,
+            entries.len()
+        );
         if valid {
+            crate::mailbox_walk_debug!(
+                "FOREIGN_STORE END type={} dht={} generation={} entries={} total_elapsed={}ms",
+                entry_type,
+                record_key,
+                index.generation,
+                entries.len(),
+                total_started.elapsed().as_millis()
+            );
             return Ok((index, entries));
         }
     }
 
+    crate::mailbox_walk_debug!(
+        "FOREIGN_STORE FAIL type={} dht={} total_elapsed={}ms reason=no-valid-generation",
+        entry_type,
+        record_key,
+        total_started.elapsed().as_millis()
+    );
     Err(MailboxError::StoreCorrupt(format!(
         "no completely valid index generation for {record_key}"
     )))

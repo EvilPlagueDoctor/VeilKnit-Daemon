@@ -29,21 +29,23 @@ rustup update
 
 ## One-command Release build
 
-Open **Developer PowerShell for VS 2022**, change to the project root, and run:
+From the top-level `Windows` folder, run:
 
 ```powershell
-.\build_gui_release.bat
+.\build_project.bat
 ```
 
-The finished pair of executables will be placed in:
+The build script compiles the Rust node, builds the native C++ GUI, and copies the finished pair into one clean release folder:
 
 ```text
-cpp_gui\bin\x64\Release\
-    VeilKnitGui.exe
-    veilid_test_node.exe
+Windows\Release\
+    VeilKnitDaemon.exe
+    VeilKnitNode.exe
 ```
 
-Keep those two files together. Run `VeilKnitGui.exe`; the Rust backend is started hidden automatically.
+The C++ project also retains its normal intermediate output under `cpp_gui\bin\x64\Release`, but you no longer need to move or rename either executable manually.
+
+Keep those two files together. Run `VeilKnitDaemon.exe`; the Rust backend is started hidden automatically.
 
 ## Manual build in Visual Studio 2022
 
@@ -56,10 +58,10 @@ cargo build --release
 Then open:
 
 ```text
-cpp_gui\VeilKnitGui.sln
+cpp_gui\VeilKnitDaemon.sln
 ```
 
-Select **Release** and **x64**, then choose **Build > Build Solution**. The C++ post-build step copies `target\release\veilid_test_node.exe` beside the GUI executable.
+Select **Release** and **x64**, then choose **Build > Build Solution**. The C++ post-build step copies `target\release\VeilKnitNode.exe` beside the GUI executable.
 
 For a Debug build, run `cargo build` first, select **Debug | x64**, and build the solution. Debug output is written to `cpp_gui\bin\x64\Debug\`.
 

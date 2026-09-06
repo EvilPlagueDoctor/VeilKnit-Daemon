@@ -47,7 +47,7 @@ use crate::{
     },
     types::{
         current_timestamp, decode_app_info, decode_user_info,
-        AppBloomFilter, AppPageBloomFilter, FullUserDHT, MailboxAdvertisement, RecordTableEntry, RecordTableManifest, RecordTablePage,
+        AppPageBloomFilter, FullUserDHT, MailboxAdvertisement, RecordTableEntry, RecordTableManifest, RecordTablePage,
         RecordTablePageDescriptor, RouteBlobRecord, UnknownEntry, APPINFO_LOCATION, BLOB_LOCATION,
         APP_DISCOVERY_ACTIVITY_TTL_SECS, MAILBOX_LOCATION, PUBLIC_METADATA_MAX_FUTURE_SKEW_SECS, RECORD_TABLE_BUCKET_COUNT,
         RECORD_TABLE_DEFAULT_PAGES_PER_READ, RECORD_TABLE_END, RECORD_TABLE_FORMAT_VERSION,
@@ -477,7 +477,7 @@ impl WalkDht {
     }
 
     async fn read_owned(&self, own_key: &RecordKey) -> DhtSnapshot {
-        let mut snapshot = snapshot_from_results(
+        let snapshot = snapshot_from_results(
             own_key.clone(),
             self.read_owned_locations(record_table_base_locations())
                 .await,
@@ -1547,11 +1547,7 @@ impl RecordTableWriter {
                                 }
                             }
                         }
-                        let outcome = publisher.publish(entries).await;
-                        crate::net_health::record_result(
-                            outcome.as_ref().err().map(|error| error.to_string()).as_deref(),
-                        );
-                        if let Err(error) = outcome {
+                        if let Err(error) = publisher.publish(entries).await {
                             crate::teprintln!("[walk] paged record-table publication failed: {error}");
                         }
                     }
@@ -2348,12 +2344,34 @@ impl WalkTask {
     }
 
     pub async fn shutdown(&self) -> Result<(), WalkError> {
+        crate::shutdown_debug!("WalkTask::shutdown: sending Shutdown command to walker actor");
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
+        if self
+            .tx
             .send(WalkCommand::Shutdown { reply: reply_tx })
             .await
-            .map_err(|_| WalkError::ActorGone)?;
-        reply_rx.await.map_err(|_| WalkError::ActorGone)
+            .is_err()
+        {
+            crate::shutdown_debug!(
+                "WalkTask::shutdown: walker actor channel was already closed"
+            );
+            return Err(WalkError::ActorGone);
+        }
+        crate::shutdown_debug!(
+            "WalkTask::shutdown: Shutdown command delivered; awaiting walker actor acknowledgement"
+        );
+        match reply_rx.await {
+            Ok(()) => {
+                crate::shutdown_debug!("WalkTask::shutdown: walker actor acknowledged shutdown");
+                Ok(())
+            }
+            Err(_) => {
+                crate::shutdown_debug!(
+                    "WalkTask::shutdown: walker actor disappeared before acknowledging shutdown"
+                );
+                Err(WalkError::ActorGone)
+            }
+        }
     }
 }
 
@@ -2375,6 +2393,11 @@ async fn walk_actor(
     user_session: Option<Arc<UserSession>>,
     events: Option<NetworkEventBus>,
 ) {
+    // Keep the JoinHandle for the actual WalkSession. A cancellation flag only asks a walk to
+    // stop; retaining the task lets shutdown prove that the session is really gone before
+    // Lifecycle is allowed to tear Veilid down.
+    let mut active_walk_task: Option<tokio::task::JoinHandle<()>> = None;
+
     while let Some(command) = rx.recv().await {
         match command {
             WalkCommand::Start { config, reply } => {
@@ -2382,6 +2405,22 @@ async fn walk_actor(
                     if handle.is_active() {
                         let _ = reply.send(Ok(WalkStartResult::AlreadyRunning(handle)));
                         continue;
+                    }
+                }
+
+                // A finished WalkStatus is published just before the WalkSession task itself
+                // returns. Reap that previous task before launching another one so the actor
+                // never accumulates detached walk tasks.
+                if let Some(task) = active_walk_task.take() {
+                    crate::shutdown_debug!(
+                        "walker actor: reaping previous walk task before starting a new walk; finished={}",
+                        task.is_finished()
+                    );
+                    match task.await {
+                        Ok(()) => crate::shutdown_debug!("walker actor: previous walk task joined"),
+                        Err(error) => crate::shutdown_debug!(
+                            "walker actor: previous walk task join reported {error}"
+                        ),
                     }
                 }
 
@@ -2444,9 +2483,19 @@ async fn walk_actor(
                     cancel,
                 };
 
-                tokio::spawn(async move {
+                let requested_hops = session.config.hop_count;
+                crate::shutdown_debug!(
+                    "walker actor: spawning WalkSession task requested_hops={requested_hops}"
+                );
+                active_walk_task = Some(tokio::spawn(async move {
+                    crate::shutdown_debug!(
+                        "walk session task: START requested_hops={requested_hops}"
+                    );
                     session.run().await;
-                });
+                    crate::shutdown_debug!(
+                        "walk session task: END requested_hops={requested_hops}"
+                    );
+                }));
 
                 let _ = reply.send(Ok(WalkStartResult::Started(handle)));
             }
@@ -2539,14 +2588,99 @@ async fn walk_actor(
                 }));
             }
             WalkCommand::Shutdown { reply } => {
+                let status = current_walk
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(WalkHandle::status);
+                crate::shutdown_debug!(
+                    "walker actor: SHUTDOWN received; walk_status={status:?} task_present={}",
+                    active_walk_task.is_some()
+                );
+
                 if let Some(handle) = current_walk.read().await.clone() {
-                    handle.cancel();
+                    if handle.is_active() {
+                        crate::shutdown_debug!(
+                            "walker actor: requesting cooperative cancellation of active WalkSession"
+                        );
+                        handle.cancel();
+                    }
                 }
+
+                if let Some(mut task) = active_walk_task.take() {
+                    if task.is_finished() {
+                        crate::shutdown_debug!(
+                            "walker actor: WalkSession task was already finished; joining it"
+                        );
+                        match task.await {
+                            Ok(()) => crate::shutdown_debug!(
+                                "walker actor: finished WalkSession joined successfully"
+                            ),
+                            Err(error) => crate::shutdown_debug!(
+                                "walker actor: finished WalkSession join reported {error}"
+                            ),
+                        }
+                    } else {
+                        const WALK_CANCEL_GRACE: Duration = Duration::from_secs(2);
+                        const WALK_ABORT_JOIN_GRACE: Duration = Duration::from_secs(2);
+                        crate::shutdown_debug!(
+                            "walker actor: waiting up to {}ms for cooperative WalkSession exit",
+                            WALK_CANCEL_GRACE.as_millis()
+                        );
+                        match tokio::time::timeout(WALK_CANCEL_GRACE, &mut task).await {
+                            Ok(joined) => match joined {
+                                Ok(()) => crate::shutdown_debug!(
+                                    "walker actor: active WalkSession exited cooperatively"
+                                ),
+                                Err(error) => crate::shutdown_debug!(
+                                    "walker actor: active WalkSession ended during cancellation with join error: {error}"
+                                ),
+                            },
+                            Err(_) => {
+                                crate::shutdown_debug!(
+                                    "walker actor: cooperative cancellation grace expired; aborting WalkSession task"
+                                );
+                                task.abort();
+                                match tokio::time::timeout(WALK_ABORT_JOIN_GRACE, &mut task).await {
+                                    Ok(Ok(())) => crate::shutdown_debug!(
+                                        "walker actor: aborted WalkSession joined as completed"
+                                    ),
+                                    Ok(Err(error)) if error.is_cancelled() => crate::shutdown_debug!(
+                                        "walker actor: aborted WalkSession confirmed cancelled and joined"
+                                    ),
+                                    Ok(Err(error)) => crate::shutdown_debug!(
+                                        "walker actor: aborted WalkSession joined with error: {error}"
+                                    ),
+                                    Err(_) => {
+                                        crate::shutdown_debug!(
+                                            "walker actor: CRITICAL - WalkSession did not join after abort; withholding shutdown acknowledgement so Lifecycle/watchdog can prevent unsafe Veilid teardown"
+                                        );
+                                        std::future::pending::<()>().await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    crate::shutdown_debug!("walker actor: no WalkSession task exists to join");
+                }
+
+                crate::shutdown_debug!("walker actor: persisting app-discovery cache");
                 if let Err(error) = app_discovery.persist().await {
                     crate::teprintln!("[walk] failed to save app-discovery cache during shutdown: {error}");
+                    crate::shutdown_debug!(
+                        "walker actor: app-discovery cache persist failed: {error}"
+                    );
+                } else {
+                    crate::shutdown_debug!("walker actor: app-discovery cache persisted");
                 }
+
+                crate::shutdown_debug!("walker actor: shutting down record-table writer");
                 record_writer.shutdown().await;
+                crate::shutdown_debug!("walker actor: record-table writer stopped");
+
                 let _ = reply.send(());
+                crate::shutdown_debug!("walker actor: shutdown acknowledgement sent; actor exiting");
                 return;
             }
         }
@@ -3157,6 +3291,7 @@ fn fire_and_forget_handshake(
 #[cfg(test)]
 mod patch_c_tests {
     use super::*;
+    use crate::types::AppBloomFilter;
 
     const KEY_ONE: &str = "VLD0:Ql5L4_BYpaHtBECl5khtcSIW-lAnnC5vV5PIZCl7vAs:9C9jBokYTHBBBaq7aev39a9ujPVCCzGLE0-Tx_N7FyQ";
     const KEY_TWO: &str = "VLD0:_kOiks1ZUX1EWMHhhCW8VVkHFiA8dAHZi8FwjPfPluA:zn52H-kRgsgzeVYabmSf4D15el-73HwVJ6o84RipMPc";

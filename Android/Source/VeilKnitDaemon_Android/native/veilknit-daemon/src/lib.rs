@@ -1,3 +1,10 @@
+//! VeilKnit daemon executable.
+//!
+//! This file is the wiring diagram: it creates the major modules, connects them together, starts
+//! the background services, and handles the console/GUI commands. The modules themselves own
+//! their real logic. Shutdown is intentionally handed to the shared `Lifecycle` coordinator so
+//! this file does not need to remember a fragile manual cleanup order.
+
 mod app;
 mod api;
 mod events;
@@ -14,10 +21,15 @@ pub(crate) use presentation::console_ui;
 pub(crate) use security::network_decode;
 
 mod blob_store;
+mod private_app_storage;
 mod stream_transport;
+mod gossip;
+mod lexical_library;
 mod dht_module;
 mod handshake;
-mod net_health;
+mod lifecycle;
+mod shutdown_debug;
+mod mailbox_walk_debug;
 mod network_supervisor;
 mod node;
 mod node_list;
@@ -45,10 +57,21 @@ mod mailbox;
 mod android_bridge;
 
 use blob_store::BlobStoreManager;
+use private_app_storage::PrivateAppStorageManager;
 use dht_module::{DHTModule, StoredDhtRecord};
 use console_ui::ConsoleDashboard;
 use user_dht::{DHT_SNAPSHOT_KEY, MainDhtRuntime};
 use handshake::HandshakeManager;
+use lexical_library::{
+    LexicalLibraryManager, LexicalObserveRequest, LEXICAL_ACTIVE_WINDOW_DAYS,
+    LEXICAL_TEST_APPLICATION_ID, LEXICAL_TEST_LAYER, LEXICAL_TEST_LIBRARY_NAME,
+};
+use gossip::{
+    derive_index_tokens, GossipManager, GossipPublishRequest, GossipSearchQuery,
+    GossipTokenMatchMode, GossipTokenPolarity, GossipTokenProbe,
+    GOSSIP_DEFAULT_TTL_SECS, GOSSIP_TEST_APPLICATION_ID, GOSSIP_TEST_INDEX_NAME,
+    GOSSIP_TEST_NAMESPACE,
+};
 use app_services::{AppSigningManager, AppStorageManager};
 use app::directory::AppDirectoryManager;
 use app::visible_names::AppVisibleNameManager;
@@ -57,6 +80,7 @@ use mailbox::{
     MailboxConfig, MailboxEvent, MailboxInit, MailboxManager, MailboxWalkRequest,
     OutgoingMessageRequest,
 };
+use lifecycle::{HookResult, HookSpec, ResourceNeed, StopReason};
 use node::*;
 use network_events::{NetworkEvent, StartupStage};
 use network_supervisor::{
@@ -68,7 +92,7 @@ use reputation::{
     AppId, CoreModuleId, ReputationManager, SubscriptionFilter,
 };
 use types::{
-    current_timestamp, decode_user_info, AppInfo, MailboxAdvertisement,
+    current_timestamp, current_timestamp_millis, decode_user_info, AppInfo, MailboxAdvertisement,
     CAPABILITY_APP_AUTH, CAPABILITY_HANDSHAKE, CAPABILITY_MAILBOX,
     CAPABILITY_MAILBOX_CUSTODIAN, CAPABILITY_NETWORK_WALK,
     CAPABILITY_PRIVATE_ROUTES, CAPABILITY_REPUTATION,
@@ -83,6 +107,11 @@ use veilid_core::RecordKey;
 
 static GUI_BRIDGE_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Starts the daemon using the Android/embedded host bridge.
+///
+/// Android owns the Tokio runtime in `android_bridge.rs`; this function deliberately remains
+/// an ordinary async function so the same daemon core can also be launched by the tiny CLI
+/// binary in `src/main.rs`.
 pub async fn run_daemon(
     gui_bridge_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -98,6 +127,17 @@ pub async fn run_daemon(
 
     crate::tprintln!("Welcome, {}!", session.username());
     let supervisor = NetworkSupervisor::default();
+    let lifecycle = supervisor.lifecycle();
+    lifecycle.set_data_dir("./user_data");
+    if let Some(previous) = lifecycle.take_previous_record() {
+        if previous.looks_dirty() {
+            crate::teprintln!(
+                "[lifecycle] previous shutdown needs review ({}): {}",
+                previous.path.display(),
+                previous.json
+            );
+        }
+    }
     let event_bus = supervisor.event_bus();
     let configuration_stage = supervisor
         .stage_running(StartupStage::Configuration, None)
@@ -764,6 +804,19 @@ pub async fn run_daemon(
         }
     };
 
+    // Local-only encrypted app vault. It is scoped to this signed-in account/profile,
+    // while each API request is further scoped to the authenticated APP_ID.
+    let private_app_storage_manager = match PrivateAppStorageManager::load(auth.clone(), session.clone()) {
+        Ok(manager) => {
+            crate::tprintln!("[private-storage] Encrypted private application storage ready.");
+            Some(manager)
+        }
+        Err(error) => {
+            crate::teprintln!("[private-storage] Private application storage unavailable: {error}");
+            None
+        }
+    };
+
     let app_visible_names = match AppVisibleNameManager::load(auth.clone(), session.clone()) {
         Ok(manager) => manager,
         Err(error) => {
@@ -774,128 +827,344 @@ pub async fn run_daemon(
         }
     };
 
+    // One daemon-owned gossip manager is shared by local IPC and the built-in
+    // two-node diagnostic. Application partitions (including the diagnostic
+    // partition) are still activated lazily when they are actually used.
+    let gossip_manager = GossipManager::new(
+        handshake_manager.clone(),
+        walk_task.clone(),
+        our_dht_key.clone(),
+    );
+
+    // Daemon-owned distributed lexical library. It reuses managed gossip for
+    // live hints and owns per-app DHT snapshots for offline librarian access.
+    let lexical_library_manager = match main_dht_runtime.clone() {
+        Some(runtime) => match LexicalLibraryManager::load(
+            auth.clone(),
+            session.clone(),
+            background.clone(),
+            runtime,
+            gossip_manager.clone(),
+            walk_task.clone(),
+            our_dht_key.clone(),
+        ).await {
+            Ok(manager) => {
+                manager.start_background().await;
+                Some(manager)
+            }
+            Err(error) => {
+                crate::teprintln!("[lexical] Distributed lexical library unavailable: {error}");
+                None
+            }
+        },
+        None => None,
+    };
+
     // Start the local application API. On Windows this is a named pipe; Unix
     // builds use an equivalent Unix-domain socket with the same JSON-lines
     // protocol. Apps must still complete IdentityManager authentication before
     // accessing status/events or future networking operations.
     let local_api_endpoint = default_endpoint(session.username());
-    let local_api = {
-        let endpoint = local_api_endpoint.clone();
-        match spawn_local_api(
-            endpoint.clone(),
-            supervisor.clone(),
-            identity_manager.clone(),
-            mailbox_manager.clone(),
-            walk_task.clone(),
-            handshake_manager.clone(),
-            session.username().to_string(),
-            session.network_profile_id().to_string(),
-            our_dht_key.clone(),
-            reputation_manager.clone(),
-            app_directory_manager.clone(),
-            app_storage_manager.clone(),
-            blob_store_manager.clone(),
-            app_signing_manager.clone(),
-            app_visible_names.clone(),
-        ) {
-            Ok(handle) => {
-                crate::tprintln!("[api] Local application API listening at {}", handle.endpoint());
-                Some(handle)
-            }
-            Err(error) => {
-                crate::teprintln!("[api] Could not start local application API at {endpoint}: {error}");
-                None
-            }
+    let endpoint = local_api_endpoint.clone();
+    let local_api = match spawn_local_api(
+        endpoint.clone(),
+        supervisor.clone(),
+        identity_manager.clone(),
+        mailbox_manager.clone(),
+        walk_task.clone(),
+        handshake_manager.clone(),
+        session.username().to_string(),
+        session.network_profile_id().to_string(),
+        our_dht_key.clone(),
+        reputation_manager.clone(),
+        app_directory_manager.clone(),
+        app_storage_manager.clone(),
+        private_app_storage_manager.clone(),
+        blob_store_manager.clone(),
+        app_signing_manager.clone(),
+        gossip_manager.clone(),
+        lexical_library_manager.clone(),
+        app_visible_names.clone(),
+    ) {
+        Ok(handle) => {
+            crate::tprintln!("[api] Local application API listening at {}", handle.endpoint());
+            Some(handle)
+        }
+        Err(error) => {
+            crate::teprintln!("[api] Could not start local application API at {endpoint}: {error}");
+            None
         }
     };
 
-    // Register low-level services first. NetworkSupervisor executes hooks in
-    // reverse order so new work stops before presence/snapshots and Veilid.
+    // Register shutdown work by declared resource requirement. Registration order no longer
+    // controls shutdown order; Lifecycle is the single executor and derives sequencing from
+    // HookSpec.
     {
         let node = node.clone();
-        supervisor.register_shutdown_hook("Veilid", move || async move {
-            node.shutdown().await;
-            Ok(())
-        }).await;
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::teardown("node/veilid").detail("detach and stop Veilid"),
+                move |progress| {
+                    let node = node.clone();
+                    async move {
+                        progress.step("detaching and stopping Veilid");
+                        node.shutdown().await;
+                        progress.step("Veilid stopped");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+    }
+    if let Some(lexical) = lexical_library_manager.clone() {
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("lexical/library", ResourceNeed::Network)
+                    .detail("flush lexical epochs/pages and stop lexical gossip")
+                    .budget(Duration::from_secs(10)),
+                move |progress| {
+                    let lexical = lexical.clone();
+                    async move {
+                        progress.step("stopping lexical background work");
+                        progress.fragile("committing dirty lexical DHT pages");
+                        lexical.shutdown().await.map_err(|error| error.to_string())?;
+                        progress.settled("lexical library committed");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
     }
     {
         let background = background.clone();
         let auth = auth.clone();
         let session = session.clone();
-        supervisor.register_shutdown_hook("DHT snapshot", move || async move {
-            let snapshot = background.export_snapshot().await;
-            auth.write_user_encrypted(&session, DHT_SNAPSHOT_KEY, &snapshot)
-                .map_err(|error| error.to_string())
-        }).await;
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("dht/snapshot", ResourceNeed::Storage)
+                    .detail("save owned DHT snapshot"),
+                move |progress| {
+                    let background = background.clone();
+                    let auth = auth.clone();
+                    let session = session.clone();
+                    async move {
+                        progress.step("exporting DHT snapshot");
+                        let snapshot = background.export_snapshot().await;
+                        let count = snapshot.len();
+                        progress.fragile("writing encrypted DHT snapshot");
+                        auth.write_user_encrypted(&session, DHT_SNAPSHOT_KEY, &snapshot)
+                            .map_err(|error| error.to_string())?;
+                        progress.settled(format!("DHT snapshot committed ({count} record(s))"));
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+    }
+    if let Some(runtime) = main_dht_runtime.clone() {
+        let heartbeat_runtime = runtime.clone();
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("presence/heartbeat", ResourceNeed::None)
+                    .detail("stop presence heartbeat")
+                    .budget(lifecycle::budget::INTAKE),
+                move |progress| {
+                    let runtime = heartbeat_runtime.clone();
+                    async move {
+                        progress.step("stopping presence heartbeat");
+                        runtime
+                            .stop_heartbeat()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        progress.step("presence heartbeat stopped");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("presence/offline", ResourceNeed::Network)
+                    .detail("publish final offline presence")
+                    .budget(lifecycle::budget::ANNOUNCE),
+                move |progress| {
+                    let runtime = runtime.clone();
+                    async move {
+                        progress.step("publishing final offline presence");
+                        runtime
+                            .publish_offline()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        progress.step("offline presence published");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
     }
     {
         let node = node.clone();
-        let runtime = main_dht_runtime.clone();
         supervisor
-            .register_shutdown_hook("Presence and attachment observer", move || async move {
-                node.clear_attachment_handler();
-                match runtime {
-                    Some(runtime) => runtime.shutdown().await.map_err(|error| error.to_string()),
-                    None => Ok(()),
-                }
-            })
+            .register_shutdown_hook(
+                HookSpec::new("presence/attachment-observer", ResourceNeed::VeilidNode)
+                    .detail("disable attachment callbacks"),
+                move |progress| {
+                    let node = node.clone();
+                    async move {
+                        progress.step("clearing attachment callback");
+                        node.clear_attachment_handler();
+                        progress.step("attachment callback cleared");
+                        Ok(())
+                    }
+                },
+            )
             .await;
     }
     {
         let reputation_manager = reputation_manager.clone();
-        supervisor.register_shutdown_hook("Reputation", move || async move {
-            reputation_manager.shutdown().await.map_err(|error| error.to_string())
-        }).await;
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("reputation", ResourceNeed::Storage)
+                    .detail("persist reputation state"),
+                move |progress| {
+                    let reputation_manager = reputation_manager.clone();
+                    async move {
+                        progress.fragile("persisting reputation state");
+                        reputation_manager
+                            .shutdown()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        progress.settled("reputation state persisted");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
     }
     if let Some(task) = reputation_event_task {
+        let task = Arc::new(tokio::sync::Mutex::new(Some(task)));
         supervisor
-            .register_shutdown_hook("Reputation event bridge", move || async move {
-                task.abort();
-                let _ = task.await;
-                Ok(())
-            })
+            .register_shutdown_hook(
+                HookSpec::new("events/reputation-bridge", ResourceNeed::None),
+                move |progress| {
+                    let task = task.clone();
+                    async move {
+                        progress.step("stopping reputation event bridge");
+                        if let Some(task) = task.lock().await.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        Ok(())
+                    }
+                },
+            )
             .await;
     }
     if let Some(mailbox) = mailbox_manager.clone() {
-        supervisor.register_shutdown_hook("Mailbox", move || async move {
-            mailbox.shutdown().await.map_err(|error| error.to_string())
-        }).await;
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("mailbox", ResourceNeed::VeilidNode)
+                    .detail("flush and stop mailbox")
+                    .budget(Duration::from_secs(15)),
+                move |progress| {
+                    let mailbox = mailbox.clone();
+                    async move {
+                        progress.fragile("flushing pending mailbox writes");
+                        mailbox.shutdown().await.map_err(|error| error.to_string())?;
+                        progress.settled("mailbox stopped");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
     }
     if let Some(walker) = walk_task.clone() {
-        supervisor.register_shutdown_hook("Walker", move || async move {
-            walker.shutdown().await.map_err(|error| error.to_string())
-        }).await;
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("walker", ResourceNeed::VeilidNode)
+                    .detail("stop network walker")
+                    .budget(Duration::from_secs(6)),
+                move |progress| {
+                    let walker = walker.clone();
+                    async move {
+                        progress.step("stopping network walker");
+                        walker.shutdown().await.map_err(|error| error.to_string())?;
+                        progress.step("network walker stopped");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
     }
     if let Some(auto_walk) = automatic_walk.clone() {
-        supervisor.register_shutdown_hook("Automatic walk scheduler", move || async move {
-            auto_walk.shutdown().await;
-            Ok(())
-        }).await;
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::new("walk/automatic-scheduler", ResourceNeed::None)
+                    .continue_after_timeout(),
+                move |progress| {
+                    let auto_walk = auto_walk.clone();
+                    async move {
+                        progress.step("stopping automatic walk scheduler");
+                        auto_walk.shutdown().await;
+                        Ok(())
+                    }
+                },
+            )
+            .await;
     }
     if let Some(task) = mailbox_event_task {
+        let task = Arc::new(tokio::sync::Mutex::new(Some(task)));
         supervisor
-            .register_shutdown_hook("Mailbox event bridge", move || async move {
-                task.abort();
-                let _ = task.await;
-                Ok(())
-            })
+            .register_shutdown_hook(
+                HookSpec::new("events/mailbox-bridge", ResourceNeed::None),
+                move |progress| {
+                    let task = task.clone();
+                    async move {
+                        progress.step("stopping mailbox event bridge");
+                        if let Some(task) = task.lock().await.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        Ok(())
+                    }
+                },
+            )
             .await;
     }
     if let Some(task) = app_info_task {
+        let task = Arc::new(tokio::sync::Mutex::new(Some(task)));
         supervisor
-            .register_shutdown_hook("Application advertisement publisher", move || async move {
-                task.abort();
-                let _ = task.await;
-                Ok(())
-            })
+            .register_shutdown_hook(
+                HookSpec::new("app/advertisement-publisher", ResourceNeed::None),
+                move |progress| {
+                    let task = task.clone();
+                    async move {
+                        progress.step("stopping application advertisement publisher");
+                        if let Some(task) = task.lock().await.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        Ok(())
+                    }
+                },
+            )
             .await;
     }
     if let Some(local_api) = local_api.clone() {
         supervisor
-            .register_shutdown_hook("Local application API", move || async move {
-                local_api.shutdown().await;
-                Ok(())
-            })
+            .register_shutdown_hook(
+                HookSpec::new("api/local", ResourceNeed::None).detail("stop local application API"),
+                move |progress| {
+                    let local_api = local_api.clone();
+                    async move {
+                        progress.step("stopping local application API intake");
+                        local_api.shutdown().await;
+                        progress.step("local application API stopped");
+                        Ok(())
+                    }
+                },
+            )
             .await;
     }
 
@@ -928,6 +1197,38 @@ pub async fn run_daemon(
         })
     });
 
+    // Console infrastructure intentionally outlives Veilid so it can display the complete
+    // network shutdown. It is still lifecycle-owned rather than being a second ad-hoc cleanup
+    // path after supervisor.shutdown().
+    let dashboard = Arc::new(tokio::sync::Mutex::new(dashboard));
+    let dashboard_event_task = Arc::new(tokio::sync::Mutex::new(dashboard_event_task));
+    {
+        let dashboard = dashboard.clone();
+        let dashboard_event_task = dashboard_event_task.clone();
+        supervisor
+            .register_shutdown_hook(
+                HookSpec::after_teardown("ui/dashboard").detail("stop console event bridge and dashboard"),
+                move |progress| {
+                    let dashboard = dashboard.clone();
+                    let dashboard_event_task = dashboard_event_task.clone();
+                    async move {
+                        progress.step("stopping dashboard event bridge");
+                        if let Some(task) = dashboard_event_task.lock().await.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        progress.step("stopping console dashboard");
+                        if let Some(dashboard) = dashboard.lock().await.take() {
+                            dashboard.shutdown();
+                        }
+                        progress.step("console dashboard stopped");
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+    }
+
     crate::tprintln!("Main is still running.");
     crate::tprintln!("Administration console ready.");
     if gui_bridge_mode {
@@ -937,6 +1238,7 @@ pub async fn run_daemon(
         android_bridge::mark_command_loop_ready();
     }
 
+    let stop_reason = StopReason::Shutdown;
     loop {
         if !gui_bridge_mode && !console_ui::is_active() {
             print_basic_command_menu();
@@ -1162,6 +1464,213 @@ pub async fn run_daemon(
                 }
             } else {
                 crate::tprintln!("Network recovery wipe cancelled.");
+            }
+            continue;
+        }
+
+        if command.eq_ignore_ascii_case("lex-test-set") {
+            crate::tprintln!("Usage: lex-test-set <words/text...>");
+            continue;
+        }
+        if let Some(arguments) = command.strip_prefix("lex-test-set ") {
+            let Some(lexical) = lexical_library_manager.as_ref() else { crate::tprintln!("[lex-test] lexical library service is unavailable"); continue; };
+            let object_hash = blake3::hash(our_dht_key.as_bytes());
+            let object_id = format!("lex-test-node-{}", hex::encode(&object_hash.as_bytes()[..8]));
+            match lexical.observe(LEXICAL_TEST_APPLICATION_ID, LexicalObserveRequest {
+                library_name: LEXICAL_TEST_LIBRARY_NAME.to_string(), layer: LEXICAL_TEST_LAYER.to_string(),
+                object_id, generation: current_timestamp_millis(), field_id: "diagnostic_text".to_string(),
+                text: Some(arguments.to_string()), pretokenized_terms: Vec::new(), authoritative_pointer: Some(our_dht_key.clone()), publish_posting_hint: true,
+            }).await {
+                Ok(result) => crate::tprintln!("[lex-test] observed {} word(s), {} unique, {} association edge(s), {} subword token(s); library={} epoch={}", result.words_observed, result.unique_words, result.associations_observed, result.subword_tokens, result.library_id.hex(), result.current_epoch),
+                Err(error) => crate::tprintln!("[lex-test] observation failed: {error}"),
+            }
+            continue;
+        }
+        if command.eq_ignore_ascii_case("lex-test-search") { crate::tprintln!("Usage: lex-test-search <word> [word ...]"); continue; }
+        if let Some(arguments) = command.strip_prefix("lex-test-search ") {
+            let Some(lexical) = lexical_library_manager.as_ref() else { crate::tprintln!("[lex-test] lexical library service is unavailable"); continue; };
+            let terms = parse_gossip_test_terms(arguments);
+            if terms.is_empty() { crate::tprintln!("Usage: lex-test-search <word> [word ...]"); continue; }
+            match lexical.search(LEXICAL_TEST_APPLICATION_ID, LEXICAL_TEST_LIBRARY_NAME, LEXICAL_TEST_LAYER, &terms, LEXICAL_ACTIVE_WINDOW_DAYS, true).await {
+                Ok(result) => {
+                    crate::tprintln!("[lex-test] {} term(s); gossip peers contacted={} durable libraries consulted={} candidate object(s)={}", result.terms.len(), result.gossip_peers_contacted, result.dht_libraries_consulted, result.candidates.len());
+                    for (term, view) in terms.iter().zip(&result.words) {
+                        crate::tprintln!("  word='{}' id={} prevalence={:.4} ({:.1}/{:.1}) rarity={:.3} specificity={:.3} confidence={:.3} utility={:.3} sources={}", term, view.word_id.short_hex(), view.stats.prevalence, view.stats.estimated_objects_containing_word, view.stats.estimated_universe_objects, view.stats.rarity_normalized, view.stats.specificity, view.stats.evidence_confidence, view.stats.search_utility, view.sources_consulted);
+                        for neighbor in view.neighbors.iter().take(6) { crate::tprintln!("      {} {} distance={} conditional={:.3} support≈{:.1} confidence={:.3}", neighbor.direction, neighbor.word_id.short_hex(), neighbor.distance, neighbor.conditional_probability, neighbor.estimated_distinct_objects, neighbor.confidence); }
+                    }
+                    for (index, candidate) in result.candidates.iter().take(12).enumerate() { crate::tprintln!("  candidate[{}] origin={} object={} generation={} matched={} pointer={}", index+1, candidate.origin_main_dht, candidate.object_id, candidate.generation, candidate.matched_words, candidate.authoritative_pointer.as_deref().unwrap_or("<none>")); }
+                }
+                Err(error) => crate::tprintln!("[lex-test] search failed: {error}"),
+            }
+            continue;
+        }
+        if let Some(arguments) = command.strip_prefix("lex-test-compare ") {
+            let Some(lexical) = lexical_library_manager.as_ref() else { crate::tprintln!("[lex-test] lexical library service is unavailable"); continue; };
+            let mut terms=arguments.split_whitespace();let left=terms.next().unwrap_or_default();let right=terms.next().unwrap_or_default();
+            if left.is_empty()||right.is_empty(){crate::tprintln!("Usage: lex-test-compare <word-a> <word-b>");}else{let score=lexical.compare_terms(left,right);crate::tprintln!("[lex-test] compare '{}' vs '{}': exact={:.3} normalized={:.3} edit={:.3} accent={:.3} translit={:.3} visual={:.3} combined={:.3}",left,right,score.exact,score.normalized,score.edit,score.accent_fold,score.transliteration,score.visual,score.combined);}
+            continue;
+        }
+        if command.eq_ignore_ascii_case("lex-test-stats") {
+            let Some(lexical)=lexical_library_manager.as_ref() else{crate::tprintln!("[lex-test] lexical library service is unavailable");continue;};
+            match lexical.stats(LEXICAL_TEST_APPLICATION_ID,LEXICAL_TEST_LIBRARY_NAME).await{Ok(stats)=>crate::tprintln!("[lex-test] stats: {stats:?}"),Err(error)=>crate::tprintln!("[lex-test] stats failed: {error}")}
+            continue;
+        }
+
+        if command.eq_ignore_ascii_case("gossip-test-set") {
+            crate::tprintln!("Usage: gossip-test-set <word> [word ...]");
+            continue;
+        }
+
+        if let Some(arguments) = command.strip_prefix("gossip-test-set ") {
+            let terms = parse_gossip_test_terms(arguments);
+            if terms.is_empty() {
+                crate::tprintln!("Usage: gossip-test-set <word> [word ...]");
+            } else {
+                match derive_index_tokens(
+                    GOSSIP_TEST_APPLICATION_ID,
+                    GOSSIP_TEST_NAMESPACE,
+                    GOSSIP_TEST_INDEX_NAME,
+                    terms.iter().map(String::as_str),
+                ) {
+                    Ok(index_tokens) => {
+                        let object_hash = blake3::hash(our_dht_key.as_bytes());
+                        let object_id = format!(
+                            "node-{}",
+                            hex::encode(&object_hash.as_bytes()[..8])
+                        );
+                        let request = GossipPublishRequest {
+                            namespace: GOSSIP_TEST_NAMESPACE.to_string(),
+                            object_id,
+                            generation: current_timestamp_millis(),
+                            authoritative_pointer: None,
+                            fingerprints: Vec::new(),
+                            index_tokens: index_tokens.clone(),
+                            custom_payload: Vec::new(),
+                            flags: 0,
+                            ttl_seconds: GOSSIP_DEFAULT_TTL_SECS,
+                        };
+                        match gossip_manager
+                            .publish(GOSSIP_TEST_APPLICATION_ID, request)
+                            .await
+                        {
+                            Ok(hit) => {
+                                crate::tprintln!(
+                                    "[gossip-test] published {} word(s) as {} opaque token(s); object={} generation={}",
+                                    terms.len(),
+                                    index_tokens.len(),
+                                    hit.record.object_id,
+                                    hit.record.generation,
+                                );
+                                crate::tprintln!(
+                                    "[gossip-test] words stay local; first token={} (search peers derive the same scoped digest)",
+                                    index_tokens
+                                        .first()
+                                        .map(|token| hex::encode(token.digest))
+                                        .unwrap_or_else(|| "<none>".to_string())
+                                );
+                            }
+                            Err(error) => crate::tprintln!("[gossip-test] publish failed: {error}"),
+                        }
+                    }
+                    Err(error) => crate::tprintln!("[gossip-test] invalid words/index: {error}"),
+                }
+            }
+            continue;
+        }
+
+        if command.eq_ignore_ascii_case("gossip-test-search") {
+            crate::tprintln!("Usage: gossip-test-search <word> [word ...]");
+            continue;
+        }
+
+        if let Some(arguments) = command.strip_prefix("gossip-test-search ") {
+            let terms = parse_gossip_test_terms(arguments);
+            if terms.is_empty() {
+                crate::tprintln!("Usage: gossip-test-search <word> [word ...]");
+            } else {
+                match derive_index_tokens(
+                    GOSSIP_TEST_APPLICATION_ID,
+                    GOSSIP_TEST_NAMESPACE,
+                    GOSSIP_TEST_INDEX_NAME,
+                    terms.iter().map(String::as_str),
+                ) {
+                    Ok(tokens) => {
+                        let query = GossipSearchQuery {
+                            namespace: GOSSIP_TEST_NAMESPACE.to_string(),
+                            probes: Vec::new(),
+                            token_probes: vec![GossipTokenProbe {
+                                tokens,
+                                polarity: GossipTokenPolarity::Required,
+                                match_mode: GossipTokenMatchMode::All,
+                                weight: 100,
+                            }],
+                            limit: 16,
+                            min_score_milli: None,
+                            include_withdrawn: false,
+                        };
+                        match gossip_manager
+                            .search(GOSSIP_TEST_APPLICATION_ID, query, true, 750)
+                            .await
+                        {
+                            Ok((query_id, contacted, hits)) => {
+                                crate::tprintln!(
+                                    "[gossip-test] query={} contacted {} peer(s); {} matching hint(s)",
+                                    query_id, contacted, hits.len()
+                                );
+                                for (index, hit) in hits.iter().enumerate() {
+                                    crate::tprintln!(
+                                        "  [{}] origin={} object={} generation={} tokens_matched={} verification={:?}",
+                                        index + 1,
+                                        hit.record.origin_main_dht,
+                                        hit.record.object_id,
+                                        hit.record.generation,
+                                        hit.matched_index_tokens,
+                                        hit.verification,
+                                    );
+                                }
+                                if contacted == 0 {
+                                    crate::tprintln!(
+                                        "[gossip-test] no peers were available; run a normal walk on both nodes first so each has verified peers."
+                                    );
+                                }
+                            }
+                            Err(error) => crate::tprintln!("[gossip-test] search failed: {error}"),
+                        }
+                    }
+                    Err(error) => crate::tprintln!("[gossip-test] invalid words/index: {error}"),
+                }
+            }
+            continue;
+        }
+
+        if command.eq_ignore_ascii_case("gossip-test-list") {
+            match gossip_manager
+                .list_recent(GOSSIP_TEST_APPLICATION_ID, Some(GOSSIP_TEST_NAMESPACE), 32)
+                .await
+            {
+                Ok(hits) => {
+                    crate::tprintln!("[gossip-test] {} cached diagnostic object(s)", hits.len());
+                    for (index, hit) in hits.iter().enumerate() {
+                        crate::tprintln!(
+                            "  [{}] origin={} object={} generation={} token_count={} verification={:?}",
+                            index + 1,
+                            hit.record.origin_main_dht,
+                            hit.record.object_id,
+                            hit.record.generation,
+                            hit.record.index_tokens.len(),
+                            hit.verification,
+                        );
+                    }
+                }
+                Err(error) => crate::tprintln!("[gossip-test] list failed: {error}"),
+            }
+            continue;
+        }
+
+        if command.eq_ignore_ascii_case("gossip-test-stats") {
+            match gossip_manager.stats(GOSSIP_TEST_APPLICATION_ID).await {
+                Ok(stats) => crate::tprintln!("[gossip-test] stats: {stats:?}"),
+                Err(error) => crate::tprintln!("[gossip-test] stats failed: {error}"),
             }
             continue;
         }
@@ -2014,18 +2523,6 @@ pub async fn run_daemon(
             }
 
             "q" | "Q" => {
-                if let Some(mailbox) = &mailbox_manager {
-                    if let Err(error) = mailbox.flush().await {
-                        crate::tprintln!("Warning: mailbox flush before quit failed: {error}");
-                    }
-                }
-                let snapshot = background.export_snapshot().await;
-                if let Err(err) = auth.write_user_encrypted(&session, DHT_SNAPSHOT_KEY, &snapshot) {
-                    crate::tprintln!("Warning: failed to save DHTs before quitting: {:?}", err);
-                } else {
-                    crate::tprintln!("Saved {} DHT(s) to your account.", snapshot.len());
-                }
-
                 crate::tprintln!("Shutting down...");
                 break;
             }
@@ -2034,21 +2531,35 @@ pub async fn run_daemon(
         }
     }
 
-    for (service, result) in supervisor.shutdown().await {
-        if let Err(error) = result {
-            crate::tprintln!("{service} shutdown warning: {error}");
+    let outcomes = supervisor.shutdown(stop_reason).await;
+    for outcome in &outcomes {
+        match &outcome.result {
+            HookResult::Failed(error) => {
+                crate::tprintln!("{} shutdown warning: {error}", outcome.module);
+            }
+            HookResult::Overran => {
+                crate::tprintln!(
+                    "{} shutdown warning: timed out while {}",
+                    outcome.module,
+                    outcome.detail
+                );
+            }
+            HookResult::Ok | HookResult::Skipped(_) => {}
         }
     }
-    crate::tprintln!("Network services stopped safely.");
-
-    if let Some(task) = dashboard_event_task {
-        task.abort();
-        let _ = task.await;
+    let had_shutdown_error = outcomes.iter().any(|outcome| {
+        matches!(&outcome.result, HookResult::Failed(_) | HookResult::Overran)
+    });
+    if lifecycle.watchdog_left_armed() {
+        crate::teprintln!(
+            "Shutdown could not prove safe quiescence; the lifecycle watchdog remains armed."
+        );
+    } else if had_shutdown_error {
+        crate::teprintln!("Shutdown completed with lifecycle warnings; review the hook results above.");
+    } else {
+        crate::tprintln!("Network services stopped safely.");
+        crate::tprintln!("Safely Shut Down");
     }
-    if let Some(dashboard) = dashboard {
-        dashboard.shutdown();
-    }
-    crate::tprintln!("Safely Shut Down");
 
     Ok(())
 }
@@ -2082,6 +2593,7 @@ async fn reconcile_current_app_info(
     Ok(true)
 }
 
+/// Parses the compact console command used to change automatic-walk settings.
 fn parse_walk_settings_command(command: &str) -> Result<WalkSettings, String> {
     let values: Vec<&str> = command.split_whitespace().skip(1).collect();
     if values.len() != 11 {
@@ -2376,6 +2888,7 @@ async fn print_own_headers(dht: &DHTModule, package_index: usize) {
     }
 }
 
+/// Escapes text before placing it into the simple line-oriented GUI bridge protocol.
 fn escape_gui_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -2400,6 +2913,7 @@ fn hex_preview(bytes: &[u8], maximum_bytes: usize) -> String {
 }
 
 /// Loops until the user successfully logs in or signs up.
+/// Small interactive desktop helper that logs into an account or creates a new one.
 fn login_or_signup(auth: &UserAuth) -> Option<UserSession> {
     loop {
         let choice = read_line("Login, Signup, or Restore local backup? (l/s/r): ");
@@ -2543,6 +3057,7 @@ fn read_subkey_selection(prompt: &str) -> Vec<u32> {
     }
 }
 
+/// Handles the developer-console mailbox commands without mixing them into mailbox internals.
 async fn handle_mail_command(mailbox: &Arc<MailboxManager>, command_line: &str) {
     let mut parts = command_line.split_whitespace();
     let _mail = parts.next();
@@ -2814,6 +3329,13 @@ fn print_command_help() {
     crate::tprintln!("  T/P/O                 Start, inspect, or stop a network walk");
     crate::tprintln!("  H/K                   Start or inspect a handshake");
     crate::tprintln!("  I                     Show internal nodes");
+    crate::tprintln!("  lex-test-set <text...>       Feed diagnostic text into the distributed lexical library");
+    crate::tprintln!("  lex-test-search <words...>    Search lexical gossip + durable librarian DHTs");
+    crate::tprintln!("  lex-test-compare <a> <b>      Compare spelling/accent/transliteration/leet similarity");
+    crate::tprintln!("  lex-test-stats                Inspect diagnostic lexical-library state");
+    crate::tprintln!("  gossip-test-set <words...>    Publish exact-search diagnostic words");
+    crate::tprintln!("  gossip-test-search <words...> Search another node for all words");
+    crate::tprintln!("  gossip-test-list/stats        Inspect the diagnostic gossip cache");
     crate::tprintln!("  D                     Show daemon and DHT status");
     crate::tprintln!("  Q                     Save and shut down");
     crate::tprintln!("Legacy DHT test commands remain available: N/G/W/A/R/L/E/X/Y/S/C.");
@@ -2843,6 +3365,15 @@ fn read_line(prompt: &str) -> String {
     buf.trim().to_owned()
 }
 
+fn parse_gossip_test_terms(input: &str) -> Vec<String> {
+    input
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn print_basic_command_menu() {
     println!("*************************************");
     println!("* N New DHT       G Inspect DHT     *");
@@ -2857,6 +3388,8 @@ fn print_basic_command_menu() {
     println!("* app-name ... App-visible aliases    *");
     println!("* profile-... Network profiles        *");
     println!("* backup-/recovery-... Identity backup *");
+    println!("* lex-test-set/search/compare/stats    *");
+    println!("* gossip-test-set/search/list/stats    *");
     println!("* U/log Save log   Q Quit             *");
     println!("*************************************");
 }
